@@ -21,6 +21,8 @@ param(
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
+$ptDir = Join-Path $env:LOCALAPPDATA 'AWM\platform-tools'
+if (Test-Path $ptDir) { $env:PATH = "$ptDir;$env:PATH" }
 
 $script:DataDir = Join-Path $env:APPDATA 'adbconnect'
 $script:CacheFile = Join-Path $script:DataDir 'devices.tsv'

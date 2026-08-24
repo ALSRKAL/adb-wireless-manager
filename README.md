@@ -162,6 +162,7 @@ LIVE=1 ./tests/run_tests.sh   # + live adb/service/tray checks
 | Tray icon missing (GNOME) | Enable AppIndicators (see prerequisites), re-login |
 | Reconnect fails right after phone reboot | Keep the pairing dialog flow: `pair` command, or plug USB once |
 | Port already in use | The tool auto-increments ports (5555…5699) |
+| QR pairing / auto-discovery never sees the phone | Distro adb builds often lack mDNS. The installer auto-downloads Google's official platform-tools to `~/.local/share/awm/` and uses them automatically (verify with `adb mdns check`) |
 | scrcpy window never opens | Install scrcpy or disable auto-launch (`AUTO_SCRCPY=false`) |
 
 ## 🤝 Contributing

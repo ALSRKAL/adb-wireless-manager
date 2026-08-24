@@ -9,7 +9,7 @@
 set -uo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="13.0.3"
+readonly VERSION="13.0.4"
 readonly SCRIPT_NAME="${0##*/}"
 
 # ------------------------------------------------------------------------------
@@ -18,6 +18,9 @@ readonly SCRIPT_NAME="${0##*/}"
 # ------------------------------------------------------------------------------
 readonly XDG_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/adbconnect"
 readonly XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/adbconnect"
+_AWM_PT="$HOME/.local/share/awm/platform-tools"
+[[ -d "$_AWM_PT" ]] && export PATH="$_AWM_PT:$PATH"
+unset _AWM_PT
 readonly CONFIG_FILE="$XDG_CONF/config"
 readonly SETTINGS_FILE="$XDG_CONF/settings.json"
 readonly CACHE_FILE="$XDG_DATA/devices.tsv"

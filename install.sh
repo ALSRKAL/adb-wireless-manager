@@ -35,6 +35,34 @@ else
     fail "adb missing — install it: sudo apt install adb  (or download Android platform-tools)"
 fi
 
+# distro adb builds often ship without the mDNS daemon (breaks auto
+# discovery / QR pairing). Auto-provision Google's official tools.
+if command -v adb >/dev/null 2>&1; then
+    if adb mdns check 2>/dev/null | grep -qi "enabled\|daemon version"; then
+        ok "adb mDNS backend available"
+    elif [[ ! -d "$HOME/.local/share/awm/platform-tools" ]]; then
+        warn "system adb lacks mDNS — downloading official platform-tools…"
+        case "$(uname -s)" in
+            Darwin) PT_URL="https://dl.google.com/android/repository/platform-tools-latest-darwin.zip" ;;
+            *)      PT_URL="https://dl.google.com/android/repository/platform-tools-latest-linux.zip" ;;
+        esac
+        mkdir -p "$HOME/.local/share/awm"
+        TMPZ="$(mktemp -u).zip"
+        if curl -fsSL -o "$TMPZ" "$PT_URL"; then
+            python3 - "$TMPZ" "$HOME/.local/share/awm" <<'PY' 2>/dev/null || unzip -qo "$TMPZ" -d "$HOME/.local/share/awm"
+import sys, zipfile
+zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])
+PY
+            find "$HOME/.local/share/awm/platform-tools" -maxdepth 1 \
+                -type f -exec chmod +x {} + 2>/dev/null
+            ok "official platform-tools installed to ~/.local/share/awm/"
+        else
+            warn "download failed — QR/auto-discovery needs official platform-tools"
+        fi
+        rm -f "$TMPZ"
+    fi
+fi
+
 if command -v python3 >/dev/null 2>&1; then
     ok "python3: $(python3 --version)"
 else

@@ -439,5 +439,29 @@ class V1303Tests(unittest.TestCase):
         self.assertIn(f"P:{pwd};;", uri)
 
 
+    def test_ensure_official_adb_path_prepends(self):
+        fd_dir = tempfile.mkdtemp()
+        try:
+            open(os.path.join(fd_dir, "adb" if os.name != "nt"
+                              else "adb.exe"), "w").close()
+            saved = os.environ.get("PATH", "")
+            orig = adbtray.official_tools_dir
+            adbtray.official_tools_dir = lambda: fd_dir
+            try:
+                res = adbtray.ensure_official_adb_path()
+                self.assertTrue(res)
+                self.assertTrue(os.environ["PATH"].startswith(fd_dir))
+            finally:
+                adbtray.official_tools_dir = orig
+                os.environ["PATH"] = saved
+        finally:
+            import shutil as _sh
+            _sh.rmtree(fd_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

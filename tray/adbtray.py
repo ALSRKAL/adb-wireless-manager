@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QMenu, QMessageBox, QPushButton, QSpinBox,
                              QSystemTrayIcon, QVBoxLayout, QWidget)
 
-__version__ = "13.0.3"
+__version__ = "13.0.4"
 REPO = "ALSRKAL/adb-wireless-manager"
 REPO_URL = f"https://github.com/{REPO}"
 
@@ -76,6 +76,28 @@ def log_file():
 
 
 LOG_FILE = log_file()
+
+
+def official_tools_dir():
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local"))
+        return os.path.join(base, "AWM", "platform-tools")
+    return os.path.expanduser("~/.local/share/awm/platform-tools")
+
+
+def ensure_official_adb_path():
+    """Shadow a mDNS-less distro adb with Google's official platform-tools."""
+    d = official_tools_dir()
+    if os.path.isdir(os.path.join(d, "platform-tools")):
+        d = os.path.join(d, "platform-tools")
+    if os.path.isfile(os.path.join(d, "adb" if not IS_WINDOWS else "adb.exe")):
+        if os.path.abspath(d) not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+        return True
+    return False
+
+
+ensure_official_adb_path()
 
 DEFAULT_SETTINGS = {
     "lang": "ar",
