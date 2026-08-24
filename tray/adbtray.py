@@ -24,7 +24,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QMenu, QMessageBox, QPushButton, QSpinBox,
                              QSystemTrayIcon, QVBoxLayout)
 
-__version__ = "13.0.0"
+__version__ = "13.0.1"
 REPO = "ALSRKAL/adb-wireless-manager"
 REPO_URL = f"https://github.com/{REPO}"
 
@@ -301,6 +301,94 @@ def mdns_pairing_targets():
         if m:
             tg.append(m.group(1))
     return sorted(set(tg))
+
+
+def build_pairing_uri(name, password):
+    return f"WIFI:T:ADB;S:{name};P:{password};;"
+
+
+def make_qr_pixmap(text, box_pixels=4):
+    """Returns QPixmap or None when qrcode lib is unavailable."""
+    try:
+        import qrcode
+    except ImportError:
+        return None
+    qr = qrcode.QRCode(border=2, box_size=box_pixels)
+    qr.add_data(text)
+    qr.make(fit=True)
+    from qrcode.image.pil import PilImage  # noqa: F401
+    img = qr.make_image(fill_color="black", back_color="white")
+    import tempfile as _tf
+    tmp = os.path.join(_tf.gettempdir(), f"awm_qr_{int(time.time()*1000)}.png")
+    img.save(tmp)
+    pm = QPixmap(tmp)
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    return pm if not pm.isNull() else None
+
+
+def save_qr_png(text, path):
+    try:
+        import qrcode
+    except ImportError:
+        return False
+    qrcode.make(text, box_size=6).save(path)
+    return True
+
+
+def get_wireless_debugging_enabled(serial):
+    out = sh(["adb", "-s", serial, "shell",
+              "settings", "get", "global", "adb_wifi_enabled"], 6).strip()
+    return out == "1"
+
+
+def evaluate_readiness(dev_state=None, wifi_dbg=None):
+    """Pure: dev_state in {None,'device','unauthorized','offline'};
+    wifi_dbg in {None,True,False}. Returns [(ok, ar, en)] where ok may
+    be True/False/None(unknown -> guidance)."""
+    items = []
+    if dev_state is None:
+        items.append((None,
+                      "افتح خيارات المطوّر (اضغط على رقم البناء 7 مرات)",
+                      "Enable Developer options (tap Build number 7 times)"))
+    else:
+        items.append((True,
+                      "خيارات المطوّر مفعّلة ✓",
+                      "Developer options enabled ✓"))
+
+    if dev_state == "unauthorized":
+        items.append((False,
+                      "اقبل نافذة التخويل على شاشة الهاتف",
+                      "Accept the authorization prompt on the phone"))
+    elif dev_state == "device":
+        items.append((True,
+                      "USB debugging مفعّل ويعمل ✓",
+                      "USB debugging enabled and working ✓"))
+    elif dev_state == "offline":
+        items.append((False,
+                      "الجهاز offline — أعد توصيل الكابل",
+                      "Device offline — reconnect the cable"))
+    else:
+        items.append((None,
+                      "لتوصيل USB: فعّل USB debugging من خيارات المطوّر",
+                      "For USB: enable USB debugging in Developer options"))
+
+    if wifi_dbg is True:
+        items.append((True,
+                      "Wireless debugging مفعّل ✓ — تابع الاقتران",
+                      "Wireless debugging ON ✓ — proceed to pairing"))
+    elif wifi_dbg is False:
+        items.append((False,
+                      "فعّل Wireless debugging من خيارات المطوّر",
+                      "Enable Wireless debugging in Developer options"))
+    else:
+        items.append((None,
+                      "للاتصال اللاسلكي: فعّل Wireless debugging ثم الإقران برمز",
+                      "For wireless: enable Wireless debugging then pair "
+                      "with code"))
+    return items
 
 
 def _busy_from_ss(out, p):
@@ -648,16 +736,33 @@ class PairDialog(QDialog):
         super().__init__()
         self.setWindowTitle(tr("اقتران لاسلكي (أندرويد 11+)",
                                "Wireless pairing (Android 11+)"))
-        self.setMinimumWidth(430)
+        self.setMinimumWidth(470)
+        from PyQt5.QtWidgets import QTabWidget
         lay = QVBoxLayout(self)
+
+        self.readiness = QLabel()
+        self.readiness.setWordWrap(True)
+        self.readiness.setTextFormat(Qt.RichText)
+        lay.addWidget(self.readiness)
+        row_r = QHBoxLayout()
+        btn_refresh = QPushButton(tr("🔄 تحديث الفحص", "🔄 Re-check"))
+        btn_refresh.clicked.connect(self.refresh_readiness)
+        row_r.addStretch(1)
+        row_r.addWidget(btn_refresh)
+        lay.addLayout(row_r)
+        self.refresh_readiness()
+
+        tabs = QTabWidget()
+
+        code_w = QWidget()
+        cl = QVBoxLayout(code_w)
         hint = QLabel(tr(
             "على الهاتف: خيارات المطوّر ← تصحيح لاسلكي ← الإقران برمز.\n"
             "أدخل عنوان الاقتران والرمز الظاهر على شاشة الهاتف.",
             "On phone: Developer options → Wireless debugging → Pair with "
             "code.\nEnter the pairing address and code shown on the phone."))
         hint.setWordWrap(True)
-        lay.addWidget(hint)
-
+        cl.addWidget(hint)
         row1 = QHBoxLayout()
         self.addr = QLineEdit()
         self.addr.setPlaceholderText(tr("العنوان مثل 192.168.1.5:37843",
@@ -666,23 +771,120 @@ class PairDialog(QDialog):
         btn_scan.clicked.connect(self.scan)
         row1.addWidget(self.addr, 1)
         row1.addWidget(btn_scan)
-        lay.addLayout(row1)
-
+        cl.addLayout(row1)
         row2 = QHBoxLayout()
         self.code = QLineEdit()
         self.code.setPlaceholderText(tr("رمز من 6 أرقام", "6-digit code"))
         row2.addWidget(self.code, 1)
-        lay.addLayout(row2)
-
-        row3 = QHBoxLayout()
+        cl.addLayout(row2)
         go = QPushButton(tr("اقتران واتصال", "Pair && Connect"))
-        cancel = QPushButton(tr("إلغاء", "Cancel"))
         go.clicked.connect(self.pair)
+        cancel = QPushButton(tr("إلغاء", "Cancel"))
         cancel.clicked.connect(self.reject)
-        row3.addStretch(1)
-        row3.addWidget(go)
-        row3.addWidget(cancel)
-        lay.addLayout(row3)
+        rowb = QHBoxLayout()
+        rowb.addStretch(1)
+        rowb.addWidget(go)
+        rowb.addWidget(cancel)
+        cl.addLayout(rowb)
+        tabs.addTab(code_w, tr("برمز", "Code"))
+
+        qr_w = QWidget()
+        ql = QVBoxLayout(qr_w)
+        qhint = QLabel(tr(
+            "يولّد رمز QR يحمل بيانات الاقتران (اسم الخدمة + الرمز) — "
+            "احفظه أو امسحه بجهاز آخر لنقل الإعداد بسرعة.\n"
+            "ملاحظة: مسح الهاتف لـ QR من الشاشة يتطلب Wi-Fi Aware "
+            "وغير مدعوم عبر adb.",
+            "Generates a QR carrying the pairing payload (service name + "
+            "code) — save it or scan with another device to transfer the "
+            "setup.\nNote: phone-scans-screen QR needs Wi-Fi Aware and is "
+            "not available via adb."))
+        qhint.setWordWrap(True)
+        ql.addWidget(qhint)
+        self.qr_img = QLabel(tr("أدخل العنوان والرمز في تبويب «برمز» أولًا",
+                                "Fill address & code in the Code tab first"))
+        self.qr_img.setAlignment(Qt.AlignCenter)
+        self.qr_img.setMinimumHeight(180)
+        ql.addWidget(self.qr_img)
+        rowq = QHBoxLayout()
+        btn_gen = QPushButton(tr("توليد / تحديث QR", "Generate / refresh QR"))
+        btn_gen.clicked.connect(self.refresh_qr)
+        btn_save = QPushButton(tr("حفظ PNG…", "Save PNG…"))
+        btn_save.clicked.connect(self.save_qr)
+        rowq.addWidget(btn_gen)
+        rowq.addWidget(btn_save)
+        rowq.addStretch(1)
+        ql.addLayout(rowq)
+        tabs.addTab(qr_w, tr("QR", "QR"))
+
+        lay.addWidget(tabs)
+
+        from PyQt5.QtCore import QTimer
+        self._t = QTimer(self)
+        self._t.timeout.connect(self.refresh_readiness)
+        self._t.start(4000)
+
+    def refresh_readiness(self):
+        usb = [d for d in list_devices() if d["usb"]]
+        dev_state = None
+        if usb:
+            st = usb[0]["state"]
+            dev_state = st if st in ("device", "unauthorized", "offline") \
+                else None
+        wifi_dbg = None
+        if dev_state == "device":
+            w = get_wireless_debugging_enabled(usb[0]["serial"])
+            wifi_dbg = {True: True, False: False}.get(w)
+        marks = {True: "<span style='color:#2ecc71'>✔</span>",
+                 False: "<span style='color:#e74c3c'>✘</span>",
+                 None: "<span style='color:#f39c12'>•</span>"}
+        lines = []
+        for okk, ar, en in evaluate_readiness(dev_state, wifi_dbg):
+            lang_en = S.get("lang") == "en"
+            lines.append(f"{marks[okk]} {en if lang_en else ar}")
+        self.readiness.setText("<br>".join(lines))
+
+    def current_uri(self):
+        addr = self.addr.text().strip()
+        code = self.code.text().strip()
+        if not re.match(r"^\S+:\d+$", addr) or not re.match(r"^\d{6}$", code):
+            return None
+        return build_pairing_uri(f"awm-{addr.split(':')[0].replace('.', '-')}",
+                                 code + "@" + addr)
+
+    def refresh_qr(self):
+        uri = self.current_uri()
+        if uri is None:
+            notify(tr("بيانات ناقصة", "Invalid input"),
+                   tr("أكمل العنوان والرمز أولًا",
+                      "Complete the address and code first"))
+            return
+        pm = make_qr_pixmap(uri, box_pixels=4)
+        if pm is None:
+            self.qr_img.setText(
+                tr("مكتبة qrcode غير مثبتة:\npip install qrcode[pil]",
+                   "qrcode lib missing:\npip install qrcode[pil]"))
+            return
+        self.qr_img.setPixmap(pm.scaled(
+            200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def save_qr(self):
+        uri = self.current_uri()
+        if uri is None:
+            notify(tr("بيانات ناقصة", "Invalid input"),
+                   tr("أكمل العنوان والرمز أولًا",
+                      "Complete the address and code first"))
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            None, tr("حفظ رمز QR", "Save QR"),
+            os.path.join(desktop_dir(), "adb_pairing_qr.png"),
+            "PNG (*.png)")
+        if not path:
+            return
+        okflag = save_qr_png(uri, path)
+        notify(tr("حفظ QR", "QR save"),
+               path if okflag else tr("مكتبة qrcode غير مثبتة",
+                                      "qrcode lib missing"))
 
     def scan(self):
         targets = mdns_pairing_targets()

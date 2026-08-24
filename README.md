@@ -2,7 +2,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)](#installation)
 [![Python](https://img.shields.io/badge/python-3.9%2B-green)](requirements.txt)
-[![Tests](https://img.shields.io/badge/tests-31%2F31%20passing-brightgreen)](tests/run_tests.sh)
+[![Tests](https://img.shields.io/badge/tests-38%2F38%20passing-brightgreen)](tests/run_tests.sh)
 [![CI](https://github.com/ALSRKAL/adb-wireless-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/ALSRKAL/adb-wireless-manager/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
@@ -34,7 +34,7 @@ once**, survives network drops, laptop reboots, and even phone reboots
 | ℹ️ | Device info card: battery %, storage, Android version, IPs | ✅ | — |
 | ✏️ | Device aliases / nicknames shown everywhere | ✅ | — |
 | 🌗 | Theme-aware tray icon (dark/light auto) + 🔔 actionable notifications | ✅ | — |
-| 🔗 | Guided wireless pairing wizard (Android 11+, no cable) | ✅ | ✅ |
+| 🔗 | Guided wireless pairing wizard (Android 11+, no cable) with live readiness checklist (Developer options / USB debugging / Wireless debugging) and QR export of the pairing payload | ✅ | ✅ |
 | 🤖 | CI on Windows/Linux/macOS + automatic EXE/binary builds on [Releases](https://github.com/ALSRKAL/adb-wireless-manager/releases) | — | — |
 | 🔄 | Built-in update checker against GitHub releases | ✅ | — |
 
@@ -48,7 +48,7 @@ adb-wireless-manager/
 ├── tray/
 │   └── adbtray.py           Cross-platform Qt tray app
 ├── tests/
-│   ├── test_core.py         Unit tests (15 cases, no device needed)
+│   ├── test_core.py         Unit tests (38 cases, no device needed)
 │   └── run_tests.sh         Full test runner (LIVE=1 for live checks)
 ├── install.sh               Linux/macOS installer (--with-watch)
 ├── uninstall.sh             Linux uninstaller
@@ -150,7 +150,7 @@ The bash CLI reads overrides from `~/.config/adbconnect/config`
 ## 🧪 Tests
 
 ```bash
-./tests/run_tests.sh          # static analysis + 15 unit tests
+./tests/run_tests.sh          # static analysis + 38 unit tests
 LIVE=1 ./tests/run_tests.sh   # + live adb/service/tray checks
 ```
 

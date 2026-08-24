@@ -29,7 +29,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: pip install PyQt5 pyinstaller
+        run: pip install PyQt5 qrcode pyinstaller
       - name: Build binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

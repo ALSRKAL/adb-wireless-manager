@@ -2,7 +2,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)](#التثبيت)
 [![Python](https://img.shields.io/badge/python-3.9%2B-green)](requirements.txt)
-[![Tests](https://img.shields.io/badge/tests-31%2F31%20passing-brightgreen)](tests/run_tests.sh)
+[![Tests](https://img.shields.io/badge/tests-38%2F38%20passing-brightgreen)](tests/run_tests.sh)
 [![CI](https://github.com/ALSRKAL/adb-wireless-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/ALSRKAL/adb-wireless-manager/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
@@ -34,7 +34,7 @@
 | ℹ️ | بطاقة معلومات الجهاز: البطارية، التخزين، نسخة أندرويد، عناوين IP | ✅ | — |
 | ✏️ | أسماء مستعارة للأجهزة تظهر في كل مكان | ✅ | — |
 | 🌗 | أيقونة تتكيف مع الثيم (داكن/فاتح) + 🔔 إشعارات بأزرار فعل | ✅ | — |
-| 🔗 | معالج اقتران لاسلكي موجّه (أندرويد 11+ بدون كابل) | ✅ | ✅ |
+| 🔗 | معالج اقتران لاسلكي موجّه (أندرويد 11+ بدون كابل) مع لوحة فحص جاهزية حيّة (خيارات المطوّر / USB debugging / Wireless debugging) وتوليد QR لبيانات الاقتران | ✅ | ✅ |
 | 🤖 | CI على Windows/Linux/macOS + بناء تلقائي لملفات EXE والتنفيذيات في [Releases](https://github.com/ALSRKAL/adb-wireless-manager/releases) | — | — |
 | 🔄 | فاحص تحديثات مدمج يقارن مع إصدارات GitHub | ✅ | — |
 
@@ -48,7 +48,7 @@ adb-wireless-manager/
 ├── tray/
 │   └── adbtray.py           تطبيق أيقونة شريط المهام (Qt) متعدد المنصات
 ├── tests/
-│   ├── test_core.py         اختبارات الوحدة (15 حالة، بدون الحاجة لجهاز)
+│   ├── test_core.py         اختبارات الوحدة (38 حالة، بدون الحاجة لجهاز)
 │   └── run_tests.sh         مشغّل الاختبارات الكامل (LIVE=1 للفحص الحي)
 ├── install.sh               مثبّت Linux/macOS (--with-watch)
 ├── uninstall.sh             مزيل التثبيت

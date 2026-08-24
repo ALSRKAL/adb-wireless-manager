@@ -2,6 +2,7 @@
 """Unit tests for ADB Wireless Manager core logic (no GUI / no device needed)."""
 import os
 import re
+import importlib.util
 import sys
 import tempfile
 import unittest
@@ -9,7 +10,19 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tray"))
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import adbtray  # noqa: E402
+
+
+_qt_app = None
+
+
+def ensure_qt_app():
+    global _qt_app
+    from PyQt5.QtWidgets import QApplication
+    if QApplication.instance() is None:
+        _qt_app = QApplication([])
 
 
 ADB_DEVICES_MIXED = """List of devices attached
@@ -309,6 +322,42 @@ class V13FeatureTests(unittest.TestCase):
     def test_config_dir_shape(self):
         d = adbtray.config_dir()
         self.assertTrue(d.endswith("adbconnect"))
+
+
+class V1301Tests(unittest.TestCase):
+    def test_build_pairing_uri_format(self):
+        uri = adbtray.build_pairing_uri("awm-192-168-1-5", "123456@192.168.1.5:37843")
+        self.assertEqual(uri,
+                         "WIFI:T:ADB;S:awm-192-168-1-5;"
+                         "P:123456@192.168.1.5:37843;;")
+
+    def test_readiness_unknown_state_gives_guidance(self):
+        items = adbtray.evaluate_readiness(None, None)
+        self.assertEqual(len(items), 3)
+        self.assertTrue(all(ok is None for ok, _, _ in items))
+
+    def test_readiness_authorized_wireless_on(self):
+        items = adbtray.evaluate_readiness("device", True)
+        flags = [ok for ok, _, _ in items]
+        self.assertEqual(flags, [True, True, True])
+
+    def test_readiness_unauthorized_flags_fix(self):
+        items = adbtray.evaluate_readiness("unauthorized", False)
+        flags = [ok for ok, _, _ in items]
+        self.assertEqual(flags, [True, False, False])
+
+    @unittest.skipUnless(importlib.util.find_spec("qrcode"),
+                         "qrcode not installed")
+    def test_qr_png_generated_and_decodable_size(self):
+        ensure_qt_app()
+        pm = adbtray.make_qr_pixmap(
+            adbtray.build_pairing_uri("test", "123456@1.2.3.4:5555"))
+        self.assertIsNotNone(pm)
+        self.assertGreater(pm.width(), 50)
+
+    def test_version_patch_compare_for_release_flow(self):
+        self.assertTrue(adbtray.version_is_newer("13.0.1", "13.0.0"))
+        self.assertFalse(adbtray.version_is_newer("13.0.1", "13.0.1"))
 
 
 if __name__ == "__main__":
