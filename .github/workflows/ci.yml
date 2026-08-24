@@ -12,6 +12,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,7 +23,19 @@ jobs:
       - name: Install dependencies
         run: pip install PyQt5
       - name: Unit tests
-        run: python -m unittest discover -s tests -v
+        shell: bash
+        run: |
+          python -m unittest discover -s tests -v 2>&1 | tee test_output.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ] && [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            {
+              echo "### ❌ Unit tests failed on $RUNNER_OS"
+              echo '```'
+              tail -60 test_output.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
       - name: Compile check
         run: python -m py_compile tray/adbtray.py
 

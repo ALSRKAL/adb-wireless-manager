@@ -22,7 +22,8 @@ readonly CONFIG_FILE="$XDG_CONF/config"
 readonly SETTINGS_FILE="$XDG_CONF/settings.json"
 readonly CACHE_FILE="$XDG_DATA/devices.tsv"
 readonly SUSPENDED_FILE="$XDG_DATA/suspended.tsv"
-readonly LOCK_FILE="/tmp/adbconnect.$(id -u).lock"
+_LOCK_FILE="/tmp/adbconnect.$(id -u).lock"
+readonly LOCK_FILE="$_LOCK_FILE"
 
 START_PORT="${ADBC_START_PORT:-5555}"          # first port to try
 MAX_RETRIES="${ADBC_MAX_RETRIES:-3}"           # connect attempts per IP
@@ -82,7 +83,11 @@ else
 fi
 
 if [[ "$LANG_CODE" == "auto" ]]; then
-    [[ "${LANG:-}${LC_ALL:-}" == *ar* ]] && LANG_CODE=ar || LANG_CODE=en
+    if [[ "${LANG:-}${LC_ALL:-}" == *ar* ]]; then
+        LANG_CODE="ar"
+    else
+        LANG_CODE="en"
+    fi
 fi
 
 declare -A T_AR=(
@@ -247,10 +252,6 @@ mdns_entries() { # "serial<TAB>ip:port" for each discovered paired device
         }'
 }
 
-mdns_targets() { # discover paired devices whose port changed (reboot / wifi toggle)
-    mdns_entries | cut -f2
-}
-
 # ------------------------------------------------------------------------------
 # 5) DEVICE LAYER
 # ------------------------------------------------------------------------------
@@ -354,7 +355,8 @@ hard_reset() { # serial ip port
 }
 
 connect_target() { # serial ip port  -> 0 on verified success
-    local serial="$1" ip="$2" port="$3" target="$ip:$3" attempt out
+    local serial="$1" ip="$2" port="$3" attempt out
+    local target="$ip:$port"
     if ! reachable_host "$ip"; then
         log WARN "$(t unreachable "$ip")"
     fi
@@ -544,6 +546,7 @@ action_watch() { # automatic healing: NEVER touches user-suspended devices
     log INFO "$(t watch "$WATCH_INTERVAL")"
     local serial ip port label ts target t mserial
     while true; do
+        # shellcheck disable=SC2034
         while IFS=$'\t' read -r serial ip port label ts; do
             [[ -z "${ip:-}" ]] && continue
             if is_suspended "$serial"; then continue; fi
@@ -678,6 +681,7 @@ if $LOCK_REQUIRED; then
     if ! flock -n 9 2>/dev/null; then die "$(t locked)"; fi
 fi
 
+# shellcheck disable=SC2317
 cleanup() { printf '%s' "$NC"; }
 trap cleanup EXIT
 trap 'printf "\n"; log WARN "interrupted"; exit 130' INT TERM

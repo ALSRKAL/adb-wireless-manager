@@ -29,8 +29,11 @@ fail() { printf '  \033[0;31m✘\033[0m %s\n' "$1"; }
 
 echo "=== ADB Wireless Manager installer ==="
 
-command -v adb >/dev/null 2>&1 && ok "adb found: $(command -v adb)" \
-    || fail "adb missing — install it: sudo apt install adb  (or download Android platform-tools)"
+if command -v adb >/dev/null 2>&1; then
+    ok "adb found: $(command -v adb)"
+else
+    fail "adb missing — install it: sudo apt install adb  (or download Android platform-tools)"
+fi
 
 if command -v python3 >/dev/null 2>&1; then
     ok "python3: $(python3 --version)"
@@ -43,16 +46,21 @@ if python3 -c "import PyQt5" >/dev/null 2>&1; then
 else
     warn "PyQt5 missing — trying pip..."
     if command -v pip3 >/dev/null 2>&1; then
-        pip3 install --user PyQt5 >/dev/null 2>&1 \
-            && ok "PyQt5 installed via pip" \
-            || warn "pip failed. Try: sudo apt install python3-pyqt5"
+        if pip3 install --user PyQt5 >/dev/null 2>&1; then
+            ok "PyQt5 installed via pip"
+        else
+            warn "pip failed. Try: sudo apt install python3-pyqt5"
+        fi
     else
         warn "pip3 missing. Try: sudo apt install python3-pyqt5"
     fi
 fi
 
-command -v scrcpy >/dev/null 2>&1 && ok "scrcpy: $(command -v scrcpy)" \
-    || warn "scrcpy not installed (optional, needed for screen mirroring): sudo apt install scrcpy"
+if command -v scrcpy >/dev/null 2>&1; then
+    ok "scrcpy: $(command -v scrcpy)"
+else
+    warn "scrcpy not installed (optional, needed for screen mirroring): sudo apt install scrcpy"
+fi
 
 chmod +x "$CLI" "$TRAY" 2>/dev/null || true
 
@@ -91,9 +99,11 @@ RestartSec=15
 WantedBy=default.target
 EOF
     systemctl --user daemon-reload
-    systemctl --user enable --now adbwatch.service \
-        && ok "Watch service enabled (systemctl --user status adbwatch)" \
-        || warn "Could not start adbwatch.service automatically"
+    if systemctl --user enable --now adbwatch.service; then
+        ok "Watch service enabled (systemctl --user status adbwatch)"
+    else
+        warn "Could not start adbwatch.service automatically"
+    fi
 elif $WITH_WATCH; then
     warn "systemd not available — skipping watch service"
 fi
