@@ -28,7 +28,10 @@ jobs:
           python -m unittest discover -s tests -v 2>&1 | tee test_output.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            url=$(curl -sf -F "file=@test_output.log" https://0x0.st || true)
+            url=$(curl -sf --data-binary @test_output.log https://paste.rs || true)
+            if [ -z "$url" ]; then
+              url=$(curl -sf -F "file=@test_output.log" https://0x0.st || true)
+            fi
             if [ -n "$url" ]; then
               echo "::error::Test log ($RUNNER_OS): $url"
             fi
