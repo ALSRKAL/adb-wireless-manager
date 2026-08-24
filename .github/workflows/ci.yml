@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install PyQt5
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Compile check
+        run: python -m py_compile tray/adbtray.py
+
+  lint-shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          shellcheck scripts/adbconnect.sh install.sh uninstall.sh
+      - name: bash syntax (installers)
+        run: bash -n install.sh uninstall.sh
+
+  lint-powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell parse check
+        shell: pwsh
+        run: |
+          $null = [scriptblock]::Create((Get-Content -Raw scripts/adbconnect.ps1))
+          Write-Host "adbconnect.ps1 parses OK"
+          $null = [scriptblock]::Create((Get-Content -Raw install.ps1))
+          Write-Host "install.ps1 parses OK"

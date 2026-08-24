@@ -2,7 +2,8 @@
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)](#installation)
 [![Python](https://img.shields.io/badge/python-3.9%2B-green)](requirements.txt)
-[![Tests](https://img.shields.io/badge/tests-15%2F15%20passing-brightgreen)](tests/run_tests.sh)
+[![Tests](https://img.shields.io/badge/tests-31%2F31%20passing-brightgreen)](tests/run_tests.sh)
+[![CI](https://github.com/ALSRKAL/adb-wireless-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/ALSRKAL/adb-wireless-manager/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
 **النسخة العربية من التوثيق | [Arabic documentation](README.ar.md)**
@@ -27,6 +28,15 @@ once**, survives network drops, laptop reboots, and even phone reboots
 | 🚫 | Manual suspend: a device you disconnect stays offline until *you* reconnect it (watch/auto-heal skips it) | ✅ | ✅ |
 | 🩺 | Environment doctor (adb / scrcpy / mDNS / network) | ✅ | ✅ |
 | 🟢 | Live tray status icon (green = connected, red = none, yellow = busy) | ✅ | — |
+| ⚙️ | Settings GUI (language, poll interval, scrcpy args, ports) + unified `settings.json` | ✅ | reads it |
+| 📸 | Screenshot & 30s screen recording per device → saved to Desktop | ✅ | — |
+| 📦 | APK installer with floating drag & drop zone (or file picker) | ✅ | — |
+| ℹ️ | Device info card: battery %, storage, Android version, IPs | ✅ | — |
+| ✏️ | Device aliases / nicknames shown everywhere | ✅ | — |
+| 🌗 | Theme-aware tray icon (dark/light auto) + 🔔 actionable notifications | ✅ | — |
+| 🔗 | Guided wireless pairing wizard (Android 11+, no cable) | ✅ | ✅ |
+| 🤖 | CI on Windows/Linux/macOS + automatic EXE/binary builds on [Releases](https://github.com/ALSRKAL/adb-wireless-manager/releases) | — | — |
+| 🔄 | Built-in update checker against GitHub releases | ✅ | — |
 
 ## 🗂 Project layout
 

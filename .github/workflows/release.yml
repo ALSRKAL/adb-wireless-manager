@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: ADBWirelessTray-windows-x64
+            ext: .exe
+          - os: ubuntu-latest
+            name: ADBWirelessTray-linux-x64
+            ext: ''
+          - os: macos-latest
+            name: ADBWirelessTray-macos
+            ext: ''
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install PyQt5 pyinstaller
+      - name: Build binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m PyInstaller --onefile --noconsole --clean `
+            --name ${{ matrix.name }} tray/adbtray.py
+      - name: Build binary (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          python -m PyInstaller --onefile --clean \
+            --name ${{ matrix.name }} tray/adbtray.py
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.name }}${{ matrix.ext }}*

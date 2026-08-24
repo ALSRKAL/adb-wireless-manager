@@ -2,7 +2,8 @@
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)](#التثبيت)
 [![Python](https://img.shields.io/badge/python-3.9%2B-green)](requirements.txt)
-[![Tests](https://img.shields.io/badge/tests-15%2F15%20passing-brightgreen)](tests/run_tests.sh)
+[![Tests](https://img.shields.io/badge/tests-31%2F31%20passing-brightgreen)](tests/run_tests.sh)
+[![CI](https://github.com/ALSRKAL/adb-wireless-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/ALSRKAL/adb-wireless-manager/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
 **English documentation | [English README](README.md)**
@@ -27,6 +28,15 @@
 | 🚫 | تعليق يدوي: الجهاز الذي تفصله بنفسك يبقى مفصولًا حتى تعيده أنت (المراقبة التلقائية تتجاهله) | ✅ | ✅ |
 | 🩺 | فحص البيئة (adb / scrcpy / mDNS / الشبكة) | ✅ | ✅ |
 | 🟢 | أيقونة حية (أخضر = متصل، أحمر = لا شيء، أصفر = جارٍ العمل) | ✅ | — |
+| ⚙️ | نافذة إعدادات كاملة (اللغة، مدة الفحص، خيارات scrcpy، المنافذ) + ملف `settings.json` موحد | ✅ | يقرؤه |
+| 📸 | لقطة شاشة وتسجيل شاشة 30 ثانية لكل جهاز → تُحفظ على سطح المكتب | ✅ | — |
+| 📦 | تثبيت APK بمنطقة إفلات عائمة (أو منتقي ملفات) | ✅ | — |
+| ℹ️ | بطاقة معلومات الجهاز: البطارية، التخزين، نسخة أندرويد، عناوين IP | ✅ | — |
+| ✏️ | أسماء مستعارة للأجهزة تظهر في كل مكان | ✅ | — |
+| 🌗 | أيقونة تتكيف مع الثيم (داكن/فاتح) + 🔔 إشعارات بأزرار فعل | ✅ | — |
+| 🔗 | معالج اقتران لاسلكي موجّه (أندرويد 11+ بدون كابل) | ✅ | ✅ |
+| 🤖 | CI على Windows/Linux/macOS + بناء تلقائي لملفات EXE والتنفيذيات في [Releases](https://github.com/ALSRKAL/adb-wireless-manager/releases) | — | — |
+| 🔄 | فاحص تحديثات مدمج يقارن مع إصدارات GitHub | ✅ | — |
 
 ## 🗂 هيكل المشروع
 

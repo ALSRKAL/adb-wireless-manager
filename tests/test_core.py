@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for ADB Wireless Manager core logic (no GUI / no device needed)."""
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -212,6 +213,94 @@ class PlatformTests(unittest.TestCase):
 
     def test_version_defined(self):
         self.assertGreaterEqual(int(adbtray.__version__.split(".")[0]), 12)
+
+
+class V13FeatureTests(unittest.TestCase):
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self._orig = adbtray.SETTINGS_FILE
+        self._sdata = dict(adbtray.S.data)
+
+    def tearDown(self):
+        adbtray.S = adbtray.Settings(self._orig)
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    def test_settings_roundtrip(self):
+        s = adbtray.Settings(self.path)
+        s.set("poll_interval_sec", 42)
+        s.set("aliases", {"ABC123": "هاتفي"})
+        s.save()
+        s2 = adbtray.Settings(self.path)
+        self.assertEqual(s2.get("poll_interval_sec"), 42)
+        self.assertEqual(s2.get("aliases")["ABC123"], "هاتفي")
+
+    def test_settings_defaults_on_missing_file(self):
+        s = adbtray.Settings("/nonexistent/x.json")
+        self.assertEqual(s.get("poll_interval_sec"),
+                         adbtray.DEFAULT_SETTINGS["poll_interval_sec"])
+
+    def test_version_is_newer(self):
+        self.assertTrue(adbtray.version_is_newer("13.1.0", "13.0.0"))
+        self.assertTrue(adbtray.version_is_newer("14", "13.9.9"))
+        self.assertFalse(adbtray.version_is_newer("13.0.0", "13.0.0"))
+        self.assertFalse(adbtray.version_is_newer("12.9", "13.0"))
+
+    def test_resolve_label_alias_priority(self):
+        aliases = {"SER1": "Work phone"}
+        self.assertEqual(
+            adbtray.resolve_label("SER1", "Pixel 7", aliases), "Work phone")
+        self.assertEqual(
+            adbtray.resolve_label("OTHER", "Pixel 7", aliases), "Pixel 7")
+
+    def test_parse_device_info_full_sample(self):
+        sample = ("SM S928U1\n"
+                  "15\n"
+                  "R5CX15D4P7P\n"
+                  "  level: 73\n"
+                  "109G   38G   71G  35%  /data\n"
+                  "2: wlan0    inet 192.168.100.100/24 brd scope global wlan0\n"
+                  "6: rmnet0    inet 10.0.0.5/30 scope global rmnet0\n")
+        info = adbtray.parse_device_info(sample)
+        self.assertEqual(info["model"], "SM S928U1")
+        self.assertEqual(info["android"], "15")
+        self.assertEqual(info["serial"], "R5CX15D4P7P")
+        self.assertEqual(info["battery"], 73)
+        self.assertEqual(info["storage"][2], "35")
+        self.assertIn("192.168.100.100", info["ips"])
+        self.assertNotIn("10.0.0.5", info["ips"])
+
+    def test_battery_regex_from_dumpsys(self):
+        raw = "  AC powered: false\n  level: 58\n  Charge counter: 1\n"
+        m = re.search(r"level:\s*(\d+)", raw)
+        self.assertEqual(int(m.group(1)), 58)
+
+    def test_is_apk_filter(self):
+        self.assertTrue(adbtray.is_apk("app.APK"))
+        self.assertFalse(adbtray.is_apk("photo.png"))
+
+    def test_tr_respects_language(self):
+        original = adbtray.S.get("lang")
+        try:
+            adbtray.S.set("lang", "en")
+            self.assertEqual(adbtray.tr("مرحبا", "Hello"), "Hello")
+            adbtray.S.set("lang", "ar")
+            self.assertEqual(adbtray.tr("مرحبا", "Hello"), "مرحبا")
+        finally:
+            adbtray.S.set("lang", original)
+
+    def test_mdns_pairing_targets_parse(self):
+        sample = ("List of mdns services\n"
+                  "\tabd-x._adb-tls-pairing._tcp\t192.168.1.9:39999\n"
+                  "\tabd-y._adb-tls-connect._tcp\t192.168.1.8:44444\n")
+        with mock.patch.object(adbtray, "sh", return_value=sample):
+            tg = adbtray.mdns_pairing_targets()
+        self.assertEqual(tg, ["192.168.1.9:39999"])
+
+    def test_config_dir_shape(self):
+        d = adbtray.config_dir()
+        self.assertTrue(d.endswith("adbconnect"))
 
 
 if __name__ == "__main__":

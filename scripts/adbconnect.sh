@@ -9,7 +9,7 @@
 set -uo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="11.0"
+readonly VERSION="13.0"
 readonly SCRIPT_NAME="${0##*/}"
 
 # ------------------------------------------------------------------------------
@@ -19,6 +19,7 @@ readonly SCRIPT_NAME="${0##*/}"
 readonly XDG_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/adbconnect"
 readonly XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/adbconnect"
 readonly CONFIG_FILE="$XDG_CONF/config"
+readonly SETTINGS_FILE="$XDG_CONF/settings.json"
 readonly CACHE_FILE="$XDG_DATA/devices.tsv"
 readonly SUSPENDED_FILE="$XDG_DATA/suspended.tsv"
 readonly LOCK_FILE="/tmp/adbconnect.$(id -u).lock"
@@ -40,6 +41,35 @@ QUIET=false
 
 # shellcheck source=/dev/null
 [[ -r "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# overlay: unified GUI settings (settings.json) win over KEY=VALUE config
+load_json_settings() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    [[ -r "$SETTINGS_FILE" ]] || return 0
+    local out
+    out=$(python3 - "$SETTINGS_FILE" <<'PY' 2>/dev/null
+import json, sys
+mapping = {"watch_interval_sec": "WATCH_INTERVAL",
+           "start_port": "START_PORT",
+           "max_retries": "MAX_RETRIES",
+           "connect_timeout_sec": "CONNECT_TIMEOUT",
+           "auto_scrcpy": "AUTO_SCRCPY",
+           "scrcpy_args": "SCRCPY_ARGS"}
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit
+for k, var in mapping.items():
+    if k in d:
+        v = d[k]
+        if isinstance(v, bool):
+            v = "true" if v else "false"
+        print(f'{var}="{v}"')
+PY
+)
+    [[ -n "$out" ]] && eval "$out"
+}
+load_json_settings
 
 # ------------------------------------------------------------------------------
 # 2) UI: colors + i18n (translation-first: no raw strings in logic)
