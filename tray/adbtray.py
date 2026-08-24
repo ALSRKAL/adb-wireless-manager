@@ -289,6 +289,15 @@ def open_in_file_manager(path):
         notify("Error", f"Cannot open: {path}")
 
 
+def collect_state():
+    return {
+        "devices": list_devices(),
+        "cached": cached_entries(),
+        "mdns": mdns_entries(),
+        "suspended": suspended_serials(),
+    }
+
+
 def lan_info():
     if IS_WINDOWS:
         out = sh(["ipconfig"], 6)
@@ -306,6 +315,7 @@ def lan_info():
 class Tray(QSystemTrayIcon):
     op_done = pyqtSignal(str, str)
     op_refresh = pyqtSignal()
+    state_ready = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -313,8 +323,14 @@ class Tray(QSystemTrayIcon):
         _tray_ref = self
         self.busy = False
         self.devices = []
+        self.cached = []
+        self.mdns = []
+        self.suspended = set()
+        self._sig = None
+        self.pending_rebuild = False
         self.op_done.connect(self.on_op_done)
-        self.op_refresh.connect(self.refresh)
+        self.op_refresh.connect(self.kick_refresh)
+        self.state_ready.connect(self.on_state_ready)
 
         self.menu = QMenu()
         self.header = self.menu.addAction("الأجهزة المتصلة | Connected Devices")
@@ -344,10 +360,62 @@ class Tray(QSystemTrayIcon):
         self.setIcon(self.make_icon(C_GRAY, "!"))
         self.setToolTip("ADB Wireless: scanning...")
 
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.refresh)
-        self.timer.start(POLL_MS)
-        QTimer.singleShot(300, self.refresh)
+        self.menu.aboutToHide.connect(self.on_menu_hidden)
+        threading.Thread(target=self._poll_loop, daemon=True).start()
+
+    def _poll_loop(self):
+        while True:
+            try:
+                self.state_ready.emit(collect_state())
+            except Exception:
+                pass
+            time.sleep(POLL_MS / 1000.0)
+
+    def on_menu_hidden(self):
+        if self.pending_rebuild:
+            self.pending_rebuild = False
+            self.rebuild_device_items()
+
+    def on_state_ready(self, state):
+        if self.busy:
+            self.pending_rebuild = True
+            return
+        self.devices = state["devices"]
+        self.cached = state["cached"]
+        self.mdns = state["mdns"]
+        self.suspended = {s.upper() for s in state["suspended"]}
+
+        online = [d for d in self.devices if d["state"] == "device"]
+        wireless = [d for d in online if not d["usb"]]
+        if not shutil.which("adb"):
+            self.setIcon(self.make_icon(C_GRAY, "!"))
+            self.setToolTip("adb not found!")
+        elif online:
+            self.setIcon(self.make_icon(C_GREEN, str(len(online))))
+            tip = "\n".join(f"{d['model']} — {d['serial']}" for d in online)
+            self.setToolTip(f"Connected ({len(wireless)} wireless):\n{tip}")
+        else:
+            self.setIcon(self.make_icon(C_RED, "0"))
+            self.setToolTip("No devices connected")
+
+        sig = repr((
+            sorted((d["serial"], d["state"]) for d in self.devices),
+            sorted((s, t) for s, t, _ in self.cached),
+            sorted(self.mdns),
+            sorted(self.suspended),
+        ))
+        if sig == self._sig:
+            return
+        self._sig = sig
+        if self.menu.isVisible():
+            self.pending_rebuild = True
+        else:
+            self.rebuild_device_items()
+
+    def kick_refresh(self):
+        threading.Thread(
+            target=lambda: self.state_ready.emit(collect_state()),
+            daemon=True).start()
 
     def make_icon(self, color, label=""):
         pm = QPixmap(64, 64)
@@ -369,25 +437,7 @@ class Tray(QSystemTrayIcon):
 
     def on_activated(self, reason):
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.Context):
-            self.refresh()
-
-    def refresh(self):
-        if self.busy:
-            return
-        self.devices = list_devices()
-        online = [d for d in self.devices if d["state"] == "device"]
-        wireless = [d for d in online if not d["usb"]]
-        if not shutil.which("adb"):
-            self.setIcon(self.make_icon(C_GRAY, "!"))
-            self.setToolTip("adb not found!")
-        elif online:
-            self.setIcon(self.make_icon(C_GREEN, str(len(online))))
-            tip = "\n".join(f"{d['model']} — {d['serial']}" for d in online)
-            self.setToolTip(f"Connected ({len(wireless)} wireless):\n{tip}")
-        else:
-            self.setIcon(self.make_icon(C_RED, "0"))
-            self.setToolTip("No devices connected")
-        self.rebuild_device_items()
+            self.kick_refresh()
 
     def rebuild_device_items(self):
         for a in self.device_actions:
@@ -397,10 +447,10 @@ class Tray(QSystemTrayIcon):
         online = [d for d in self.devices if d["state"] == "device"]
         bad = [d for d in self.devices if d["state"] != "device"]
         connected = {d["serial"] for d in self.devices}
-        offline = [(s, t, lbl) for s, t, lbl in cached_entries()
+        offline = [(s, t, lbl) for s, t, lbl in self.cached
                    if t not in connected]
-        for mserial, t in mdns_entries():
-            if (t not in connected and t not in {x for _, x, _ in offline}):
+        for mserial, t in self.mdns:
+            if t not in connected and t not in {x for _, x, _ in offline}:
                 offline.append((mserial, t, "mDNS"))
 
         if not online and not bad and not offline:
@@ -420,7 +470,7 @@ class Tray(QSystemTrayIcon):
             self._add(a)
 
         for sserial, t, lbl in offline:
-            if is_suspended(sserial):
+            if sserial.upper() in self.suspended:
                 sub = QMenu(f"🚫 {lbl} — موقوف بواسطتك ({t})", self.menu)
             else:
                 sub = QMenu(f"📴 {lbl} — غير متصل ({t})", self.menu)
@@ -620,6 +670,7 @@ class Tray(QSystemTrayIcon):
     def on_op_done(self, title, msg):
         self.set_busy(False)
         notify(title, msg)
+        self.kick_refresh()
 
 
 def acquire_single_instance_lock():
