@@ -375,6 +375,8 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(d._tabs.currentIndex(), 0)
         self.assertTrue(d.scan_uri.startswith("WIFI:T:ADB;"))
 
+    @unittest.skipUnless(importlib.util.find_spec("qrcode"),
+                         "qrcode not installed")
     def test_pair_dialog_tabs_actually_visible(self):
         ensure_qt_app()
         d = adbtray.PairDialog(start_tab="scan")
