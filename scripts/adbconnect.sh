@@ -9,7 +9,7 @@
 set -uo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="13.0.2"
+readonly VERSION="13.0.3"
 readonly SCRIPT_NAME="${0##*/}"
 
 # ------------------------------------------------------------------------------
@@ -470,6 +470,7 @@ action_reconnect() { # explicit user action: overrides and clears suspensions
         if connect_target "" "$ip" "$port"; then
             ok=true; launch_scrcpy "$target" "$label"
             suspend_del "$serial"
+            cache_put "$serial" "$ip" "$port" "$label"
         fi
     done <<< "$rows"
     # catches paired devices whose wireless port changed after reboot / wifi toggle
@@ -483,7 +484,11 @@ action_reconnect() { # explicit user action: overrides and clears suspensions
         log INFO "$(t mdns "$t")"
         if connect_target "" "${t%:*}" "${t##*:}"; then
             ok=true; launch_scrcpy "$t" "$(device_label "$t")"
-            [[ -n "$mserial" ]] && suspend_del "$mserial"
+            [[ -n "$mserial" ]] && {
+                suspend_del "$mserial"
+                cache_put "$mserial" "${t%:*}" "${t##*:}" \
+                    "$(device_label "$t")"
+            }
         fi
     done < <(mdns_entries)
     [[ "$ok" == true ]]
@@ -562,8 +567,11 @@ action_watch() { # automatic healing: NEVER touches user-suspended devices
             [[ -n "$mserial" ]] && is_suspended "$mserial" && continue
             [[ "$(state_of "$t")" == "device" ]] && continue
             log INFO "$(t mdns "$t")"
-            connect_target "" "${t%:*}" "${t##*:}" \
-                && launch_scrcpy "$t" "$(device_label "$t")"
+            if connect_target "" "${t%:*}" "${t##*:}"; then
+                launch_scrcpy "$t" "$(device_label "$t")"
+                [[ -n "$mserial" ]] && cache_put "$mserial" \
+                    "${t%:*}" "${t##*:}" "$(device_label "$t")"
+            fi
         done < <(mdns_entries)
         sleep "$WATCH_INTERVAL"
     done

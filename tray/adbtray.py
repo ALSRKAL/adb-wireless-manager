@@ -6,8 +6,10 @@ Repo: https://github.com/ALSRKAL/adb-wireless-manager
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
+import string
 import subprocess
 import sys
 import tempfile
@@ -24,7 +26,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QMenu, QMessageBox, QPushButton, QSpinBox,
                              QSystemTrayIcon, QVBoxLayout, QWidget)
 
-__version__ = "13.0.2"
+__version__ = "13.0.3"
 REPO = "ALSRKAL/adb-wireless-manager"
 REPO_URL = f"https://github.com/{REPO}"
 
@@ -305,6 +307,54 @@ def mdns_pairing_targets():
 
 def build_pairing_uri(name, password):
     return f"WIFI:T:ADB;S:{name};P:{password};;"
+
+
+def gen_pair_creds():
+    alphabet = string.ascii_uppercase + string.digits
+    name = "awm-" + "".join(secrets.choice(string.digits)
+                            for _ in range(6))
+    pwd = "".join(secrets.choice(alphabet) for _ in range(6))
+    return name, pwd
+
+
+def find_pairing_service(out, name):
+    for line in out.splitlines():
+        m = re.match(
+            rf"\s*{re.escape(name)}\._adb-tls-pairing\._tcp\s+(\S+:\d+)"
+            r"\s*$", line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def find_connect_service(out):
+    for line in out.splitlines():
+        if "_adb-tls-connect" not in line:
+            continue
+        m = re.search(r"(\S+:\d+)\s*$", line.strip())
+        if m:
+            return m.group(1)
+    return None
+
+
+def save_cache_entry(serial, target, label):
+    host, _, port = target.rpartition(":")
+    try:
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        rows = []
+        try:
+            with open(CACHE_FILE, encoding="utf-8") as f:
+                rows = [l for l in f.readlines()
+                        if l.split("\t")[0].strip() != serial]
+        except OSError:
+            pass
+        rows.append(f"{serial}\t{host}\t{port}\t{label}\t"
+                    f"{int(time.time())}\n")
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            f.writelines(rows)
+        return True
+    except OSError:
+        return False
 
 
 def make_qr_pixmap(text, box_pixels=4):
@@ -732,8 +782,12 @@ class SettingsDialog(QDialog):
 
 
 class PairDialog(QDialog):
+    scan_done = pyqtSignal()
+
     def __init__(self, start_tab="code"):
         super().__init__()
+        self._stop_scan = False
+        self.scan_done.connect(self.accept)
         self.setWindowTitle(tr("اقتران لاسلكي (أندرويد 11+)",
                                "Wireless pairing (Android 11+)"))
         self.setMinimumWidth(470)
@@ -817,10 +871,42 @@ class PairDialog(QDialog):
         ql.addLayout(rowq)
         tabs.addTab(qr_w, tr("QR", "QR"))
 
-        lay.addWidget(tabs)
+        tabs.addTab(qr_w, tr("QR يدوي", "Manual QR"))
+
+        scan_w = QWidget()
+        sl = QVBoxLayout(scan_w)
+        self.scan_qr_img = QLabel()
+        self.scan_qr_img.setAlignment(Qt.AlignCenter)
+        sl.addWidget(self.scan_qr_img)
+        self._scan_name, self._scan_pwd = gen_pair_creds()
+        self.scan_uri = build_pairing_uri(self._scan_name, self._scan_pwd)
+        qrpm = make_qr_pixmap(self.scan_uri, box_pixels=4)
+        if qrpm is not None:
+            self.scan_qr_img.setPixmap(qrpm.scaled(
+                230, 230, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            self.scan_qr_img.setText(
+                tr("مكتبة qrcode غير مثبتة:\npip install qrcode[pil]",
+                   "qrcode lib missing:\npip install qrcode[pil]"))
+        hint2 = QLabel(tr(
+            f"{tr('اسم الخدمة', 'Service')}: {self._scan_name}    "
+            f"{tr('الرمز', 'Code')}: {self._scan_pwd}\n"
+            "على الهاتف: خيارات المطوّر ← تصحيح لاسلكي ← "
+            "«إقران الجهاز برمز QR» ثم امسح هذا الرمز.",
+            "On phone: Developer options → Wireless debugging → "
+            "'Pair device with QR code' then scan this."))
+        hint2.setWordWrap(True)
+        sl.addWidget(hint2)
+        self.scan_status = QLabel(tr("⏳ بانتظار مسح الهاتف…",
+                                     "⏳ Waiting for phone to scan…"))
+        self.scan_status.setWordWrap(True)
+        sl.addWidget(self.scan_status)
+        tabs.addTab(scan_w, tr("مسح تلقائي", "Auto-scan"))
         self._tabs = tabs
         if start_tab == "qr":
             tabs.setCurrentIndex(1)
+        elif start_tab == "scan":
+            tabs.setCurrentIndex(2)
 
         self.addr.textChanged.connect(self._live_qr)
         self.code.textChanged.connect(self._live_qr)
@@ -829,6 +915,68 @@ class PairDialog(QDialog):
         self._t = QTimer(self)
         self._t.timeout.connect(self.refresh_readiness)
         self._t.start(4000)
+
+        if start_tab in ("qr", "scan"):
+            threading.Thread(target=self.scan_watch_loop,
+                             daemon=True).start()
+
+    def scan_watch_loop(self):
+        deadline = time.time() + 180
+        paired_addr = None
+        while time.time() < deadline:
+            if getattr(self, "_stop_scan", False):
+                return
+            out = sh(["adb", "mdns", "services"], 6)
+            addr = find_pairing_service(out, self._scan_name)
+            if addr:
+                status = tr("تم العثور على الهاتف — جارٍ الاقتران…",
+                            "Phone found — pairing…")
+                self.scan_status_safe(status)
+                pout = sh(["adb", "pair", addr, self._scan_pwd], 25)
+                if "Success" not in pout and "success" not in pout:
+                    self.scan_status_safe(tr("فشل الاقتران ✗ أعد المحاولة",
+                                             "Pairing failed ✗ retry"))
+                    return
+                paired_addr = addr
+                break
+            time.sleep(1)
+        if paired_addr is None:
+            self.scan_status_safe(tr("انتهت المهلة — لم يتم مسح الرمز",
+                                     "Timed out — QR was not scanned"))
+            return
+        conn_addr = None
+        deadline2 = time.time() + 30
+        while time.time() < deadline2 \
+                and not getattr(self, "_stop_scan", False):
+            out = sh(["adb", "mdns", "services"], 6)
+            conn_addr = find_connect_service(out)
+            if conn_addr:
+                break
+            time.sleep(1)
+        target = conn_addr or paired_addr
+        sh(["adb", "connect", target], 12)
+        states = {d["serial"] for d in list_devices()
+                  if d["state"] == "device"}
+        if target in states or conn_addr:
+            serial = device_serial(target)
+            model = sh(["adb", "-s", target, "shell",
+                        "getprop ro.product.model"], 6).strip() or "?"
+            save_cache_entry(serial, target, model.replace("_", " "))
+            notify(tr("تم الاقتران والاتصال ✓",
+                      "Paired && connected ✓"), target)
+            self.kick_refresh()
+            self.scan_done.emit()
+            return
+        self.scan_status_safe(tr("اقترن لكن لم يتصل — جرّب زر إعادة الاتصال",
+                                 "Paired but connect failed — try reconnect"))
+
+    def done(self, r):
+        self._stop_scan = True
+        super().done(r)
+
+    def scan_status_safe(self, text):
+        from PyQt5.QtCore import QTimer as _Q
+        _Q.singleShot(0, lambda: self.scan_status.setText(text))
 
     def _live_qr(self):
         if self._tabs.currentIndex() == 1 and \
@@ -1047,9 +1195,10 @@ class Tray(QSystemTrayIcon):
         act_pair = self.menu.addAction(tr("🔗  اقتران لاسلكي (بدون كابل)",
                                           "🔗  Wireless pairing (no cable)"))
         act_pair.triggered.connect(lambda: PairDialog().exec_())
-        act_qr = self.menu.addAction(tr("📱  اتصال بـ QR",
-                                        "📱  QR connect"))
-        act_qr.triggered.connect(lambda: PairDialog(start_tab="qr").exec_())
+        act_qr = self.menu.addAction(tr("📱  اتصال بـ QR (مسح تلقائي)",
+                                        "📱  QR connect (auto-scan)"))
+        act_qr.triggered.connect(
+            lambda: PairDialog(start_tab="scan").exec_())
         act_apk = self.menu.addAction(tr("📦  تثبيت ملفات APK…",
                                          "📦  Install APK files…"))
         act_apk.triggered.connect(lambda: self.install_flow(None))
@@ -1454,6 +1603,7 @@ class Tray(QSystemTrayIcon):
                         break
                 if good:
                     suspend_del(serial)
+                    save_cache_entry(serial or device_serial(t), t, label)
                     ok.append(f"{label} ({t})")
                 else:
                     fail.append(f"{label} ({t})")
@@ -1491,6 +1641,7 @@ class Tray(QSystemTrayIcon):
                     sh(["adb", "connect", tgt], 10)
                     states = {x["serial"]: x["state"] for x in list_devices()}
                     if states.get(tgt) == "device":
+                        save_cache_entry(serial, tgt, d["model"])
                         results.append(f"{d['model']} → {tgt}")
                         done = True
                         break
@@ -1543,6 +1694,8 @@ class Tray(QSystemTrayIcon):
                     break
             if good:
                 suspend_del(serial)
+                save_cache_entry(serial or device_serial(target), target,
+                                 tr("جهاز", "device"))
                 self.op_done.emit(tr("إعادة الاتصال", "Reconnect"),
                                   f"{tr('تم', 'Done')}: {target}")
             else:

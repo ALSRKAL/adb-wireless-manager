@@ -393,5 +393,51 @@ class GuiSmokeTests(unittest.TestCase):
             adbtray.S.save()
 
 
+class V1303Tests(unittest.TestCase):
+    def test_gen_pair_creds_format(self):
+        name, pwd = adbtray.gen_pair_creds()
+        self.assertTrue(re.match(r"^awm-\d{6}$", name))
+        self.assertEqual(len(pwd), 6)
+        self.assertTrue(re.match(r"^[A-Z0-9]{6}$", pwd))
+
+    def test_find_pairing_service_matches_exact_name(self):
+        out = ("\tawm-123456._adb-tls-pairing._tcp\t192.168.1.9:39999\n"
+               "\tother._adb-tls-pairing._tcp\t10.0.0.1:11111\n")
+        self.assertEqual(adbtray.find_pairing_service(out, "awm-123456"),
+                         "192.168.1.9:39999")
+        self.assertIsNone(adbtray.find_pairing_service(out, "nope"))
+
+    def test_find_connect_service(self):
+        out = "\tabd-x._adb-tls-connect._tcp\t192.168.100.100:37123\n"
+        self.assertEqual(adbtray.find_connect_service(out),
+                         "192.168.100.100:37123")
+        self.assertIsNone(adbtray.find_connect_service("nothing here"))
+
+    def test_save_cache_entry_inserts_and_updates(self):
+        fd, path = tempfile.mkstemp(suffix=".tsv")
+        os.close(fd)
+        orig = adbtray.CACHE_FILE
+        adbtray.CACHE_FILE = path
+        try:
+            adbtray.save_cache_entry("S1", "10.0.0.5:5555", "Dev A")
+            adbtray.save_cache_entry("S2", "10.0.0.6:5556", "Dev B")
+            rows = dict((s, (t, l)) for s, t, l in
+                        [(c[0], c[1], c[2]) for c in adbtray.cached_entries()])
+            self.assertEqual(rows["S1"], ("10.0.0.5:5555", "Dev A"))
+            adbtray.save_cache_entry("S1", "172.16.0.9:4444", "Dev A")
+            entries = {c[0]: c[1] for c in adbtray.cached_entries()}
+            self.assertEqual(entries["S1"], "172.16.0.9:4444")
+            self.assertEqual(len(entries), 2)
+        finally:
+            adbtray.CACHE_FILE = orig
+            os.unlink(path)
+
+    def test_scan_uri_uses_generated_creds(self):
+        name, pwd = adbtray.gen_pair_creds()
+        uri = adbtray.build_pairing_uri(name, pwd)
+        self.assertIn(f"S:{name};", uri)
+        self.assertIn(f"P:{pwd};;", uri)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
