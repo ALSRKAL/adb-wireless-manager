@@ -130,25 +130,6 @@ powershell -File scripts\adbconnect.ps1 doctor
 | Phone reboots | Its wireless port changes → mDNS discovery finds it again |
 | You unpair on the phone | Run `pair` (or plug USB once more) to re-pair |
 
-### 🌐 Remote access over the internet (different networks, no server)
-
-Want to reach your phone even when it is on **mobile data or another Wi-Fi**?
-Use a free mesh VPN — **[Tailscale](https://tailscale.com)** (recommended) or
-ZeroTier. No server to host: devices talk to each other directly over an
-encrypted WireGuard tunnel.
-
-1. Install Tailscale on the phone (Play Store) and on the computer; log in
-   with the same account. Each device gets a permanent `100.x.y.z` IP.
-2. Plug the phone via USB once and run `connect` — the tool automatically
-   saves the phone's Tailscale IP alongside its LAN IP.
-3. From anywhere in the world: hit **🔄 Reconnect all** (or
-   `./scripts/adbconnect.sh reconnect`) — it dials the saved Tailscale IP
-   over the internet.
-
-> Notes: mDNS auto-discovery is link-local only, so remote reconnects use the
-> cached Tailscale address. After a phone reboot, TCP/IP mode turns off —
-> plug USB once to re-enable it.
-
 ## ⚙️ Configuration
 
 The bash CLI reads overrides from `~/.config/adbconnect/config`

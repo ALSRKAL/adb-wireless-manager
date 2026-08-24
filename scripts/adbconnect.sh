@@ -549,8 +549,6 @@ action_doctor() {
     log INFO "cache : $CACHE_FILE ($(cache_rows | grep -c . || true) devices)"
     log INFO "log   : $LOG_FILE"
     log INFO "lan   : $(ip -o -4 addr show scope global 2>/dev/null | awk '{printf "%s(%s) ", $2, $4}')"
-    log INFO "vpn   : $(ip -o -4 addr show 2>/dev/null \
-        | awk '$2 ~ /^(tailscale0|zt[0-9a-z]+)$/ {printf "%s(%s) ", $2, $4}')"
     action_list
 }
 
