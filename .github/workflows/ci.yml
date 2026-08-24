@@ -35,6 +35,11 @@ jobs:
             if [ -n "$url" ]; then
               echo "::error::Test log ($RUNNER_OS): $url"
             fi
+            tail -45 test_output.log | grep -v '^[[:space:]]*$' | tail -9 \
+              | while IFS= read -r ln; do
+                  echo "::error::$ln"
+                done
+          fi
             if [ -n "$GITHUB_STEP_SUMMARY" ]; then
               {
                 echo "### ❌ Unit tests failed on $RUNNER_OS"
