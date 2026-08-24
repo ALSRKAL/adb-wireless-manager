@@ -303,15 +303,22 @@ def mdns_pairing_targets():
     return sorted(set(tg))
 
 
+def _busy_from_ss(out, p):
+    return bool(re.search(rf"[:.]{p}(\s|$)", out))
+
+
+def _busy_from_netstat(out, p):
+    if re.search(rf":{p}\s.*LISTENING", out):
+        return True
+    return bool(re.search(rf"[:.]{p}\s", out))
+
+
 def port_busy(p):
     if IS_WINDOWS:
-        out = sh(["netstat", "-an"], 6)
-        return bool(re.search(rf":{p}\s.*LISTENING", out))
+        return _busy_from_netstat(sh(["netstat", "-an"], 6), p)
     if IS_MACOS or not shutil.which("ss"):
-        out = sh(["netstat", "-an"], 6)
-        return bool(re.search(rf"[:.]{p}\s", out))
-    out = sh(["ss", "-Htuln"], 5)
-    return bool(re.search(rf"[:.]{p}(\s|$)", out))
+        return _busy_from_netstat(sh(["netstat", "-an"], 6), p)
+    return _busy_from_ss(sh(["ss", "-Htuln"], 5), p)
 
 
 def next_free_port(start=None):

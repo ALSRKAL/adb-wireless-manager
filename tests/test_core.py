@@ -124,13 +124,21 @@ class PhoneIpsTests(unittest.TestCase):
         self.assertNotIn("192.0.0.4", ips)
 
 
+WIN_NETSTAT_SAMPLE = """
+  TCP    0.0.0.0:5555           0.0.0.0:0              LISTENING
+  TCP    [::]:445               [::]:0                 LISTENING
+"""
+
+
 class PortTests(unittest.TestCase):
-    def test_port_busy_detects_listeners_linux_ss(self):
-        with mock.patch.object(adbtray, "sh", return_value=SS_BUSY_SAMPLE), \
-             mock.patch.object(adbtray.shutil, "which", return_value="/usr/bin/ss"):
-            self.assertTrue(adbtray.port_busy(5555))
-            self.assertTrue(adbtray.port_busy(5556))
-            self.assertFalse(adbtray.port_busy(5557))
+    def test_ss_parser(self):
+        self.assertTrue(adbtray._busy_from_ss(SS_BUSY_SAMPLE, 5555))
+        self.assertTrue(adbtray._busy_from_ss(SS_BUSY_SAMPLE, 5556))
+        self.assertFalse(adbtray._busy_from_ss(SS_BUSY_SAMPLE, 5557))
+
+    def test_netstat_windows_parser(self):
+        self.assertTrue(adbtray._busy_from_netstat(WIN_NETSTAT_SAMPLE, 5555))
+        self.assertFalse(adbtray._busy_from_netstat(WIN_NETSTAT_SAMPLE, 5599))
 
     def test_next_free_port_skips_busy(self):
         busy = {5555, 5556}
