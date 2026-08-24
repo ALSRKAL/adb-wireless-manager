@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""ADB Wireless Manager - cross-platform system tray app (Windows/Linux/macOS)."""
+"""ADB Wireless Manager - cross-platform system tray app (Windows/Linux/macOS).
+
+Repo: https://github.com/ALSRKAL/adb-wireless-manager
+"""
 import os
 import re
 import shutil

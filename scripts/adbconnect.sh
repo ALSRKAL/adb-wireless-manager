@@ -4,6 +4,7 @@
 #  Wireless ADB manager: connect / reconnect / pair / watch / doctor
 #  Supports classic tcpip (Android <11) and Wireless Debugging mDNS (Android 11+)
 #  Requires: bash 4+, adb.  Optional: scrcpy, ss|netstat, ping, jq
+#  Repo    : https://github.com/ALSRKAL/adb-wireless-manager
 # ==============================================================================
 set -uo pipefail
 IFS=$'\n\t'

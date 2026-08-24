@@ -2,6 +2,7 @@
 #  ADB Wireless Manager - Windows CLI  v12.0
 #  connect / reconnect / list / disconnect / pair / watch / doctor
 #  Requires: adb (platform-tools). Optional: scrcpy.
+#  Repo    : https://github.com/ALSRKAL/adb-wireless-manager
 # ==============================================================================
 [CmdletBinding()]
 param(

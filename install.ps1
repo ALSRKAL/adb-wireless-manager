@@ -1,5 +1,6 @@
 # ==============================================================================
 #  ADB Wireless Manager - Windows installer
+#  Repo: https://github.com/ALSRKAL/adb-wireless-manager
 #  Run with:  powershell -ExecutionPolicy Bypass -File install.ps1
 # ==============================================================================
 $ErrorActionPreference = 'Continue'

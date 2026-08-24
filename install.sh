@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 #  ADB Wireless Manager - Linux/macOS installer
+#  Repo: https://github.com/ALSRKAL/adb-wireless-manager
 #  Usage:
 #    ./install.sh                 install tray autostart only
 #    ./install.sh --with-watch    also install systemd auto-reconnect service
