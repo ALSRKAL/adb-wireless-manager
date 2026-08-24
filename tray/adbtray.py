@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QMenu, QMessageBox, QPushButton, QSpinBox,
                              QSystemTrayIcon, QVBoxLayout, QWidget)
 
-__version__ = "13.0.8"
+__version__ = "13.0.9"
 REPO = "ALSRKAL/adb-wireless-manager"
 REPO_URL = f"https://github.com/{REPO}"
 
@@ -1186,6 +1186,7 @@ class Tray(QSystemTrayIcon):
     op_refresh = pyqtSignal()
     state_ready = pyqtSignal(object)
     info_ready = pyqtSignal(str)
+    busy_release = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -1201,9 +1202,13 @@ class Tray(QSystemTrayIcon):
         self.pending_rebuild = False
         self._prev_online = None
         self._dropzone = None
+        self._busy_deadline = 0.0
+        self._busy_owner = None
+        self._queued = None
         self.op_done.connect(self.on_op_done)
         self.op_refresh.connect(self.kick_refresh)
         self.state_ready.connect(self.on_state_ready)
+        self.busy_release.connect(self.on_busy_release)
         self.info_ready.connect(lambda text: QMessageBox.information(
             None, tr("معلومات الجهاز", "Device info"), text))
 
@@ -1217,6 +1222,11 @@ class Tray(QSystemTrayIcon):
 
         self.menu.aboutToHide.connect(self.on_menu_hidden)
         threading.Thread(target=self._poll_loop, daemon=True).start()
+
+        from PyQt5.QtCore import QTimer
+        self._wd = QTimer(self)
+        self._wd.timeout.connect(self.watchdog_tick)
+        self._wd.start(3000)
 
     def build_static(self):
         self.menu.clear()
@@ -1313,8 +1323,8 @@ class Tray(QSystemTrayIcon):
                 msg += ("\n" if msg else "") + \
                     tr("فشل: ", "Failed: ") + "، ".join(badl)
             self.op_done.emit(tr("تثبيت APK", "APK install"), msg)
-        self.set_busy(True, tr("جارٍ التثبيت...", "Installing..."))
-        threading.Thread(target=job, daemon=True).start()
+        self.run_job(job, blocking=True, timeout=180,
+                     hint=tr("جارٍ التثبيت...", "Installing..."))
 
     def screenshot(self, target, model):
         def job():
@@ -1595,24 +1605,39 @@ class Tray(QSystemTrayIcon):
         self.menu.insertAction(self.sep1, a)
         self.device_actions.append(a)
 
-    def set_busy(self, busy, hint=""):
+    def set_busy(self, busy, hint="", timeout=45):
         self.busy = busy
+        self._busy_deadline = time.time() + timeout if busy else 0.0
         if busy:
             self.setIcon(make_icon(C_YELLOW, "…"))
             self.setToolTip(hint or tr("جارٍ العمل...",
                                        "Working..."))
 
-    def run_job(self, job, hint=""):
-        """Single entry point for background ops. Owns the busy lifecycle."""
-        if getattr(self, "_job_running", False):
-            notify(tr("انتظر", "Please wait"),
-                   tr("توجد عملية جارية حاليًا",
-                      "An operation is already running"))
+    def on_busy_release(self, token):
+        if token is not None and token is not self._busy_owner:
             return
-        self._job_running = True
-        self.busy = True
-        self.setIcon(make_icon(C_YELLOW, "…"))
-        self.setToolTip(hint or tr("جارٍ العمل...", "Working..."))
+        self.busy = False
+        self._busy_deadline = 0.0
+        self._busy_owner = None
+        self.run_queued()
+
+    def run_queued(self):
+        q = self._queued
+        self._queued = None
+        if q is not None:
+            self.run_job(q, blocking=True)
+
+    def run_job(self, job, blocking=True, timeout=45, hint=""):
+        """Ownership-token gate: expiry + queue + watchdog, never sticks."""
+        token = object()
+        if blocking and self.busy and self._busy_owner is not None \
+                and time.time() < self._busy_deadline:
+            self._queued = job
+            notify(tr("انتظر", "Please wait"),
+                   tr("سيُنفَّذ تلقائيًا بعد انتهاء العملية الحالية",
+                      "Will run automatically after the current "
+                      "operation"))
+            return
 
         def runner():
             try:
@@ -1620,11 +1645,17 @@ class Tray(QSystemTrayIcon):
             except Exception as e:
                 self.op_done.emit(tr("خطأ", "Error"), str(e))
             finally:
-                if self.busy:
-                    self.busy = False
-                    self.kick_refresh()
+                self.busy_release.emit(token)
 
+        if blocking:
+            self._busy_owner = token
+            self.set_busy(True, hint=hint, timeout=timeout)
         threading.Thread(target=runner, daemon=True).start()
+
+    def watchdog_tick(self):
+        if self.busy and self._busy_deadline \
+                and time.time() > self._busy_deadline:
+            self.on_busy_release(self._busy_owner)
 
     def reconnect_all(self):
         def job():
@@ -1666,8 +1697,8 @@ class Tray(QSystemTrayIcon):
                 msg = tr("لا توجد أجهزة محفوظة. وصّل الجهاز بـ USB أولًا.",
                          "No saved devices. Plug one via USB first.")
             self.op_done.emit(tr("إعادة الاتصال", "Reconnect"), msg)
-        self.set_busy(True, tr("جارٍ إعادة الاتصال...", "Reconnecting..."))
-        self.run_job(job)
+        self.run_job(job, blocking=True, timeout=90,
+                     hint=tr("جارٍ إعادة الاتصال...", "Reconnecting..."))
 
     def usb_connect_flow(self):
         def job():
@@ -1698,9 +1729,9 @@ class Tray(QSystemTrayIcon):
                     results.append(f"{d['model']} → {tr('فشل', 'failed')}")
             self.op_done.emit(tr("توصيل USB", "USB connect"),
                               "\n".join(results))
-        self.set_busy(True, tr("جارٍ توصيل الجهاز عبر USB...",
-                               "Connecting via USB..."))
-        self.run_job(job)
+        self.run_job(job, blocking=True, timeout=60,
+                     hint=tr("جارٍ توصيل الجهاز عبر USB...",
+                             "Connecting via USB..."))
 
     def disconnect_all(self):
         def job():
@@ -1737,8 +1768,6 @@ class Tray(QSystemTrayIcon):
                               if d["state"] == "device"}
             good = False
             for i in range(2):
-                self.busy_hint(f"{tr('محاولة', 'Attempt')} "
-                               f"{i + 1}/2 → {target}")
                 sh(["adb", "connect", target], 6)
                 time.sleep(1)
                 if target in online():
@@ -1747,7 +1776,6 @@ class Tray(QSystemTrayIcon):
             if not good and serial:
                 t = mdns_target_for_serial(mdns_entries(), serial)
                 if t:
-                    self.busy_hint(f"mDNS → {t}")
                     sh(["adb", "connect", t], 8)
                     time.sleep(1)
                     if t in online():
@@ -1766,12 +1794,7 @@ class Tray(QSystemTrayIcon):
                     tr("إعادة الاتصال", "Reconnect"),
                     tr(f"فشل {target} — تأكد أن الهاتف والشبكة يعملان",
                        f"Failed {target} — check phone & network"))
-        self.set_busy(True, f"{tr('إعادة اتصال', 'Reconnecting')}: {target}")
-        self.run_job(job)
-
-    def busy_hint(self, text):
-        from PyQt5.QtCore import QTimer as _Q
-        _Q.singleShot(0, lambda: self.setToolTip(text) if self.busy else None)
+        self.run_job(job, blocking=False)
 
     def remove_saved(self, target):
         drop_from_cache(target)
@@ -1814,7 +1837,6 @@ class Tray(QSystemTrayIcon):
                                 tr("فحص النظام", "Doctor"), text)
 
     def on_op_done(self, title, msg):
-        self.set_busy(False)
         notify(title, msg)
         self.kick_refresh()
 

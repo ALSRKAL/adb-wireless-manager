@@ -5,6 +5,7 @@ import re
 import importlib.util
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -501,6 +502,64 @@ class V1303Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class OpGateTests(unittest.TestCase):
+    """The operation gate must never stick: expiry, queue, watchdog."""
+
+    def test_gate_expiry_runs_immediately(self):
+        ensure_qt_app()
+        t = adbtray.Tray()
+        ran = []
+        t.set_busy(True, timeout=0.15)
+        time.sleep(0.2)
+        t.run_job(lambda: ran.append(1), blocking=True, timeout=30)
+        self.assertEqual(ran, [1])
+        self.assertTrue(t.busy)
+        t.on_busy_release(t._busy_owner)
+        self.assertFalse(t.busy)
+
+    def test_gate_queues_while_busy_then_releases(self):
+        ensure_qt_app()
+        t = adbtray.Tray()
+        ran = []
+
+        def first():
+            time.sleep(1.2)
+            ran.append("first")
+
+        t.run_job(first, blocking=True, timeout=30)
+        deadline = time.time() + 2
+        while not ran and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(ran, ["first"])
+        t.run_job(lambda: ran.append("q"), blocking=True)
+        self.assertEqual(ran, ["first"])
+        self.assertIsNotNone(t._queued)
+        t.on_busy_release(t._busy_owner)
+        deadline = time.time() + 2
+        while len(ran) < 2 and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(ran, ["first", "q"])
+        t.on_busy_release(t._busy_owner)
+        self.assertFalse(t.busy)
+
+    def test_watchdog_clears_expired_busy(self):
+        ensure_qt_app()
+        t = adbtray.Tray()
+        t.set_busy(True, timeout=0.1)
+        time.sleep(0.2)
+        t.watchdog_tick()
+        self.assertFalse(t.busy)
+
+    def test_foreign_release_ignored(self):
+        ensure_qt_app()
+        t = adbtray.Tray()
+        t.set_busy(True, timeout=30)
+        t.on_busy_release(object())
+        self.assertTrue(t.busy)
+        t.on_busy_release(None)
+        self.assertFalse(t.busy)
 
 
 if __name__ == "__main__":
