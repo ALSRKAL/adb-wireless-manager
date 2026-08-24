@@ -289,6 +289,19 @@ def open_in_file_manager(path):
         notify("Error", f"Cannot open: {path}")
 
 
+def vpn_info():
+    if IS_WINDOWS:
+        out = sh(["ipconfig"], 6)
+        lines = [l.strip() for l in out.splitlines()
+                 if "Tailscale" in l or "ZeroTier" in l]
+        return " | ".join(lines) or "not detected"
+    out = sh("ip -o -4 addr show".split(), 6)
+    hits = [f"{p[1]}({p[3]})" for p in (l.split() for l in out.splitlines())
+            if len(p) >= 4 and (p[1].startswith("tailscale")
+                                or p[1].startswith("zt"))]
+    return " ".join(hits) or "not detected"
+
+
 def collect_state():
     return {
         "devices": list_devices(),
@@ -659,6 +672,7 @@ class Tray(QSystemTrayIcon):
             f"scrcpy        : {scrcpy_path}\n"
             f"mDNS          : {mdns}\n"
             f"This machine  : {lan_info()}\n"
+            f"VPN (Tailscale/ZeroTier): {vpn_info()}\n"
             f"{watch_line}"
             f"Devices       : {n_dev} connected\n"
             f"Saved devices : {n_cache}\n"
