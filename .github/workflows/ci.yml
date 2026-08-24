@@ -25,13 +25,12 @@ jobs:
       - name: Unit tests
         shell: bash
         run: |
-          python -m unittest discover -s tests -v 2>&1 | tee test_output.log
-          status=${PIPESTATUS[0]}
+          set +e
+          python -m unittest discover -s tests -v > test_output.log 2>&1
+          status=$?
+          cat test_output.log
           if [ "$status" -ne 0 ]; then
             url=$(curl -sf --data-binary @test_output.log https://paste.rs || true)
-            if [ -z "$url" ]; then
-              url=$(curl -sf -F "file=@test_output.log" https://0x0.st || true)
-            fi
             if [ -n "$url" ]; then
               echo "::error::Test log ($RUNNER_OS): $url"
             fi
@@ -39,7 +38,6 @@ jobs:
               | while IFS= read -r ln; do
                   echo "::error::$ln"
                 done
-          fi
             if [ -n "$GITHUB_STEP_SUMMARY" ]; then
               {
                 echo "### ❌ Unit tests failed on $RUNNER_OS"
