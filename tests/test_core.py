@@ -360,5 +360,38 @@ class V1301Tests(unittest.TestCase):
         self.assertFalse(adbtray.version_is_newer("13.0.1", "13.0.1"))
 
 
+class GuiSmokeTests(unittest.TestCase):
+    """Headless construction tests — catch silent slot crashes."""
+
+    def test_pair_dialog_builds(self):
+        ensure_qt_app()
+        d = adbtray.PairDialog()
+        self.assertTrue(d.readiness.text())
+        self.assertEqual(d._tabs.currentIndex(), 0)
+
+    def test_pair_dialog_qr_start_tab(self):
+        ensure_qt_app()
+        d = adbtray.PairDialog(start_tab="qr")
+        self.assertEqual(d._tabs.currentIndex(), 1)
+
+    def test_dropzone_has_close_button(self):
+        ensure_qt_app()
+        z = adbtray.DropZone(tray=None)
+        self.assertTrue(hasattr(z, "close_btn"))
+        self.assertTrue(z.close_btn.isVisibleTo(z))
+
+    def test_dropzone_close_hides_and_saves(self):
+        ensure_qt_app()
+        z = adbtray.DropZone(tray=None)
+        orig = adbtray.S.get("dropzone_geometry")
+        try:
+            z.show()
+            z.close_me()
+            self.assertFalse(z.isVisible())
+        finally:
+            adbtray.S.set("dropzone_geometry", orig)
+            adbtray.S.save()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

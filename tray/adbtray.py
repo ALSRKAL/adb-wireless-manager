@@ -20,11 +20,11 @@ from PyQt5.QtCore import QRect, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QCursor, QFont, QIcon, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QFileDialog, QFormLayout, QHBoxLayout,
-                             QInputDialog, QLabel, QLineEdit, QMainWindow,
+                             QInputDialog, QLabel, QLineEdit,
                              QMenu, QMessageBox, QPushButton, QSpinBox,
-                             QSystemTrayIcon, QVBoxLayout)
+                             QSystemTrayIcon, QVBoxLayout, QWidget)
 
-__version__ = "13.0.1"
+__version__ = "13.0.2"
 REPO = "ALSRKAL/adb-wireless-manager"
 REPO_URL = f"https://github.com/{REPO}"
 
@@ -732,12 +732,11 @@ class SettingsDialog(QDialog):
 
 
 class PairDialog(QDialog):
-    def __init__(self):
+    def __init__(self, start_tab="code"):
         super().__init__()
         self.setWindowTitle(tr("اقتران لاسلكي (أندرويد 11+)",
                                "Wireless pairing (Android 11+)"))
         self.setMinimumWidth(470)
-        from PyQt5.QtWidgets import QTabWidget
         lay = QVBoxLayout(self)
 
         self.readiness = QLabel()
@@ -752,6 +751,7 @@ class PairDialog(QDialog):
         lay.addLayout(row_r)
         self.refresh_readiness()
 
+        from PyQt5.QtWidgets import QTabWidget
         tabs = QTabWidget()
 
         code_w = QWidget()
@@ -818,11 +818,22 @@ class PairDialog(QDialog):
         tabs.addTab(qr_w, tr("QR", "QR"))
 
         lay.addWidget(tabs)
+        self._tabs = tabs
+        if start_tab == "qr":
+            tabs.setCurrentIndex(1)
+
+        self.addr.textChanged.connect(self._live_qr)
+        self.code.textChanged.connect(self._live_qr)
 
         from PyQt5.QtCore import QTimer
         self._t = QTimer(self)
         self._t.timeout.connect(self.refresh_readiness)
         self._t.start(4000)
+
+    def _live_qr(self):
+        if self._tabs.currentIndex() == 1 and \
+                self.addr.text().strip() and self.code.text().strip():
+            self.refresh_qr()
 
     def refresh_readiness(self):
         usb = [d for d in list_devices() if d["usb"]]
@@ -926,8 +937,8 @@ class PairDialog(QDialog):
         self.accept()
 
 
-class DropZone(QMainWindow):
-    def __init__(self, tray):
+class DropZone(QWidget):
+    def __init__(self, tray=None):
         super().__init__()
         self.tray = tray
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint
@@ -938,22 +949,40 @@ class DropZone(QMainWindow):
         lbl.setStyleSheet(
             "background:#17202a;color:#ecf0f1;border:3px dashed #3498db;"
             "border-radius:16px;font-size:15px;font-weight:bold;")
-        lblFixedSize = 150
-        lbl.setFixedHeight(lblFixedSize)
-        self.setFixedSize(lblFixedSize, lblFixedSize)
-        self.setCentralWidget(lbl)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(lbl)
+        self.setFixedSize(150, 150)
+        from PyQt5.QtWidgets import QToolButton
+        self.close_btn = QToolButton(self)
+        self.close_btn.setText("✕")
+        self.close_btn.setFixedSize(24, 24)
+        self.close_btn.setStyleSheet(
+            "QToolButton{border:none;background:#e74c3c;color:white;"
+            "border-radius:12px;font-weight:bold;}"
+            "QToolButton:hover{background:#c0392b;}")
+        self.close_btn.clicked.connect(self.close_me)
+        g = QApplication.primaryScreen().availableGeometry()
+        self.move(g.right() - self.width() - 30,
+                  g.bottom() - self.height() - 40)
+
+    def place_saved(self):
         geo = S.get("dropzone_geometry")
-        placed = False
         if isinstance(geo, list) and len(geo) == 2:
             x, y = geo
             screen = QApplication.primaryScreen().availableGeometry()
-            if screen.contains(x + lblFixedSize, y + lblFixedSize):
+            if screen.contains(x + self.width(), y + self.height()):
                 self.move(x, y)
-                placed = True
-        if not placed:
-            g = QApplication.primaryScreen().availableGeometry()
-            self.move(g.right() - self.width() - 30,
-                      g.bottom() - self.height() - 40)
+
+    def resizeEvent(self, e):
+        self.close_btn.move(self.width() - 28, 4)
+        super().resizeEvent(e)
+
+    def close_me(self):
+        g = self.geometry()
+        S.set("dropzone_geometry", [g.x(), g.y()])
+        S.save()
+        self.hide()
 
     def dragEnterEvent(self, e):
         if any(is_apk(u.toLocalFile()) for u in e.mimeData().urls()):
@@ -962,7 +991,7 @@ class DropZone(QMainWindow):
     def dropEvent(self, e):
         paths = [u.toLocalFile() for u in e.mimeData().urls()
                  if is_apk(u.toLocalFile())]
-        if paths:
+        if paths and self.tray is not None:
             self.tray.install_flow(paths)
 
 
@@ -1018,6 +1047,9 @@ class Tray(QSystemTrayIcon):
         act_pair = self.menu.addAction(tr("🔗  اقتران لاسلكي (بدون كابل)",
                                           "🔗  Wireless pairing (no cable)"))
         act_pair.triggered.connect(lambda: PairDialog().exec_())
+        act_qr = self.menu.addAction(tr("📱  اتصال بـ QR",
+                                        "📱  QR connect"))
+        act_qr.triggered.connect(lambda: PairDialog(start_tab="qr").exec_())
         act_apk = self.menu.addAction(tr("📦  تثبيت ملفات APK…",
                                          "📦  Install APK files…"))
         act_apk.triggered.connect(lambda: self.install_flow(None))
@@ -1040,17 +1072,19 @@ class Tray(QSystemTrayIcon):
     def ensure_dropzone(self):
         if self._dropzone is None:
             self._dropzone = DropZone(self)
+            self._dropzone.place_saved()
             self._dropzone.show()
 
     def toggle_dropzone(self):
         if self._dropzone is not None and self._dropzone.isVisible():
-            g = self._dropzone.geometry()
-            S.set("dropzone_geometry", [g.x(), g.y()])
-            S.save()
-            self._dropzone.hide()
+            self.close_me_dropzone()
         else:
             self.ensure_dropzone()
             self._dropzone.show()
+
+    def close_me_dropzone(self):
+        if self._dropzone is not None:
+            self._dropzone.close_me()
 
     def install_flow(self, paths):
         if not paths:
