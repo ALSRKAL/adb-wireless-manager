@@ -552,6 +552,27 @@ class OpGateTests(unittest.TestCase):
         t.watchdog_tick()
         self.assertFalse(t.busy)
 
+    def test_reconnect_one_job_runs_without_unbound(self):
+        ensure_qt_app()
+        t = adbtray.Tray()
+        msgs = []
+        t.op_done.connect(lambda title, msg: msgs.append(msg))
+        with mock.patch.object(adbtray, "sh", return_value=""), \
+             mock.patch.object(adbtray, "list_devices", return_value=[]), \
+             mock.patch.object(adbtray, "mdns_entries", return_value=[]), \
+             mock.patch.object(adbtray, "device_serial",
+                               return_value="TESTSER"):
+            t.reconnect_one("1.2.3.4:5555", "")
+            from PyQt5.QtWidgets import QApplication
+            deadline = time.time() + 5
+            while not msgs and time.time() < deadline:
+                QApplication.processEvents()
+                time.sleep(0.02)
+        self.assertTrue(msgs, "operation must report a result")
+        joined = " ".join(msgs)
+        self.assertNotIn("cannot access local variable", joined)
+        self.assertIn("1.2.3.4", joined)
+
     def test_foreign_release_ignored(self):
         ensure_qt_app()
         t = adbtray.Tray()

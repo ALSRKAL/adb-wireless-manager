@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QMenu, QMessageBox, QPushButton, QSpinBox,
                              QSystemTrayIcon, QVBoxLayout, QWidget)
 
-__version__ = "13.0.9"
+__version__ = "13.0.10"
 REPO = "ALSRKAL/adb-wireless-manager"
 REPO_URL = f"https://github.com/{REPO}"
 
@@ -1762,38 +1762,39 @@ class Tray(QSystemTrayIcon):
 
     def reconnect_one(self, target, serial=""):
         def job():
-            serial = serial or device_serial(target)
-            suspend_del(serial)
+            dev_serial = serial or device_serial(target)
+            suspend_del(dev_serial)
+            final_target = target
             online = lambda: {d["serial"] for d in list_devices()
                               if d["state"] == "device"}
             good = False
             for i in range(2):
-                sh(["adb", "connect", target], 6)
+                sh(["adb", "connect", final_target], 6)
                 time.sleep(1)
-                if target in online():
+                if final_target in online():
                     good = True
                     break
-            if not good and serial:
-                t = mdns_target_for_serial(mdns_entries(), serial)
+            if not good and dev_serial:
+                t = mdns_target_for_serial(mdns_entries(), dev_serial)
                 if t:
                     sh(["adb", "connect", t], 8)
                     time.sleep(1)
                     if t in online():
                         good = True
-                        target = t
+                        final_target = t
             if good:
-                suspend_del(serial)
+                suspend_del(dev_serial)
                 model = next((d["model"] for d in list_devices()
-                              if d["serial"] == target), target)
-                save_cache_entry(serial or device_serial(target), target,
-                                 model)
+                              if d["serial"] == final_target), final_target)
+                save_cache_entry(dev_serial or device_serial(final_target),
+                                 final_target, model)
                 self.op_done.emit(tr("إعادة الاتصال", "Reconnect"),
-                                  f"{tr('تم', 'Done')}: {target}")
+                                  f"{tr('تم', 'Done')}: {final_target}")
             else:
                 self.op_done.emit(
                     tr("إعادة الاتصال", "Reconnect"),
-                    tr(f"فشل {target} — تأكد أن الهاتف والشبكة يعملان",
-                       f"Failed {target} — check phone & network"))
+                    tr(f"فشل {final_target} — تأكد أن الهاتف والشبكة يعملان",
+                       f"Failed {final_target} — check phone & network"))
         self.run_job(job, blocking=False)
 
     def remove_saved(self, target):
