@@ -367,12 +367,26 @@ class GuiSmokeTests(unittest.TestCase):
         ensure_qt_app()
         d = adbtray.PairDialog()
         self.assertTrue(d.readiness.text())
+        self.assertEqual(d._tabs.currentIndex(), 1)
+
+    def test_pair_dialog_tab_order_scan_first(self):
+        ensure_qt_app()
+        d = adbtray.PairDialog(start_tab="scan")
         self.assertEqual(d._tabs.currentIndex(), 0)
+        self.assertTrue(d.scan_uri.startswith("WIFI:T:ADB;"))
 
     def test_pair_dialog_qr_start_tab(self):
         ensure_qt_app()
         d = adbtray.PairDialog(start_tab="qr")
-        self.assertEqual(d._tabs.currentIndex(), 1)
+        self.assertEqual(d._tabs.currentIndex(), 2)
+
+    def test_mdns_target_for_serial(self):
+        entries = [("R5CX15D4P7P", "192.168.1.5:1234"),
+                   ("RZCN8017T9E", "192.168.1.6:5678")]
+        self.assertEqual(
+            adbtray.mdns_target_for_serial(entries, "r5cx15d4p7p"),
+            "192.168.1.5:1234")
+        self.assertIsNone(adbtray.mdns_target_for_serial(entries, "NOPE"))
 
     def test_dropzone_has_close_button(self):
         ensure_qt_app()

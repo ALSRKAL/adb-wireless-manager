@@ -9,7 +9,7 @@
 set -uo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="13.0.4"
+readonly VERSION="13.0.5"
 readonly SCRIPT_NAME="${0##*/}"
 
 # ------------------------------------------------------------------------------

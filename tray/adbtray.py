@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QMenu, QMessageBox, QPushButton, QSpinBox,
                              QSystemTrayIcon, QVBoxLayout, QWidget)
 
-__version__ = "13.0.4"
+__version__ = "13.0.5"
 REPO = "ALSRKAL/adb-wireless-manager"
 REPO_URL = f"https://github.com/{REPO}"
 
@@ -356,6 +356,14 @@ def find_connect_service(out):
         m = re.search(r"(\S+:\d+)\s*$", line.strip())
         if m:
             return m.group(1)
+    return None
+
+
+def mdns_target_for_serial(entries, serial):
+    s = (serial or "").upper()
+    for mserial, t in entries:
+        if mserial.upper() == s:
+            return t
     return None
 
 
@@ -813,6 +821,7 @@ class PairDialog(QDialog):
         self.setWindowTitle(tr("اقتران لاسلكي (أندرويد 11+)",
                                "Wireless pairing (Android 11+)"))
         self.setMinimumWidth(470)
+        self.resize(500, 660)
         lay = QVBoxLayout(self)
 
         self.readiness = QLabel()
@@ -829,6 +838,36 @@ class PairDialog(QDialog):
 
         from PyQt5.QtWidgets import QTabWidget
         tabs = QTabWidget()
+
+        scan_w = QWidget()
+        sl = QVBoxLayout(scan_w)
+        self.scan_qr_img = QLabel()
+        self.scan_qr_img.setAlignment(Qt.AlignCenter)
+        sl.addWidget(self.scan_qr_img)
+        self._scan_name, self._scan_pwd = gen_pair_creds()
+        self.scan_uri = build_pairing_uri(self._scan_name, self._scan_pwd)
+        qrpm = make_qr_pixmap(self.scan_uri, box_pixels=4)
+        if qrpm is not None:
+            self.scan_qr_img.setPixmap(qrpm.scaled(
+                240, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            self.scan_qr_img.setText(
+                tr("مكتبة qrcode غير مثبتة:\npip install qrcode[pil]",
+                   "qrcode lib missing:\npip install qrcode[pil]"))
+        hint2 = QLabel(tr(
+            f"{tr('اسم الخدمة', 'Service')}: {self._scan_name}    "
+            f"{tr('الرمز', 'Code')}: {self._scan_pwd}\n"
+            "على الهاتف: خيارات المطوّر ← تصحيح لاسلكي ← "
+            "«إقران الجهاز برمز QR» ثم امسح هذا الرمز.",
+            "On phone: Developer options → Wireless debugging → "
+            "'Pair device with QR code' then scan this."))
+        hint2.setWordWrap(True)
+        sl.addWidget(hint2)
+        self.scan_status = QLabel(tr("⏳ بانتظار مسح الهاتف…",
+                                     "⏳ Waiting for phone to scan…"))
+        self.scan_status.setWordWrap(True)
+        sl.addWidget(self.scan_status)
+        tabs.addTab(scan_w, tr("مسح تلقائي", "Auto-scan"))
 
         code_w = QWidget()
         cl = QVBoxLayout(code_w)
@@ -891,44 +930,11 @@ class PairDialog(QDialog):
         rowq.addWidget(btn_save)
         rowq.addStretch(1)
         ql.addLayout(rowq)
-        tabs.addTab(qr_w, tr("QR", "QR"))
-
         tabs.addTab(qr_w, tr("QR يدوي", "Manual QR"))
 
-        scan_w = QWidget()
-        sl = QVBoxLayout(scan_w)
-        self.scan_qr_img = QLabel()
-        self.scan_qr_img.setAlignment(Qt.AlignCenter)
-        sl.addWidget(self.scan_qr_img)
-        self._scan_name, self._scan_pwd = gen_pair_creds()
-        self.scan_uri = build_pairing_uri(self._scan_name, self._scan_pwd)
-        qrpm = make_qr_pixmap(self.scan_uri, box_pixels=4)
-        if qrpm is not None:
-            self.scan_qr_img.setPixmap(qrpm.scaled(
-                230, 230, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        else:
-            self.scan_qr_img.setText(
-                tr("مكتبة qrcode غير مثبتة:\npip install qrcode[pil]",
-                   "qrcode lib missing:\npip install qrcode[pil]"))
-        hint2 = QLabel(tr(
-            f"{tr('اسم الخدمة', 'Service')}: {self._scan_name}    "
-            f"{tr('الرمز', 'Code')}: {self._scan_pwd}\n"
-            "على الهاتف: خيارات المطوّر ← تصحيح لاسلكي ← "
-            "«إقران الجهاز برمز QR» ثم امسح هذا الرمز.",
-            "On phone: Developer options → Wireless debugging → "
-            "'Pair device with QR code' then scan this."))
-        hint2.setWordWrap(True)
-        sl.addWidget(hint2)
-        self.scan_status = QLabel(tr("⏳ بانتظار مسح الهاتف…",
-                                     "⏳ Waiting for phone to scan…"))
-        self.scan_status.setWordWrap(True)
-        sl.addWidget(self.scan_status)
-        tabs.addTab(scan_w, tr("مسح تلقائي", "Auto-scan"))
         self._tabs = tabs
-        if start_tab == "qr":
-            tabs.setCurrentIndex(1)
-        elif start_tab == "scan":
-            tabs.setCurrentIndex(2)
+        idx = {"scan": 0, "code": 1, "qr": 2}.get(start_tab, 0)
+        tabs.setCurrentIndex(idx)
 
         self.addr.textChanged.connect(self._live_qr)
         self.code.textChanged.connect(self._live_qr)
@@ -1350,7 +1356,8 @@ class Tray(QSystemTrayIcon):
             return
         S.set("aliases", aliases)
         S.save()
-        self.kick_refresh()
+        self._sig = None
+        self.rebuild_device_items()
 
     def _poll_loop(self):
         while True:
@@ -1453,6 +1460,7 @@ class Tray(QSystemTrayIcon):
             sorted(self.mdns),
             sorted(self.suspended),
             sorted(self.batteries.items()),
+            sorted((k, v) for k, v in (S.get("aliases") or {}).items()),
             S.get("lang"),
         ))
         if sig == self._sig:
@@ -1584,18 +1592,27 @@ class Tray(QSystemTrayIcon):
             self.setToolTip(hint or tr("جارٍ العمل...",
                                        "Working..."))
 
-    def run_job(self, job):
-        if self.busy:
+    def run_job(self, job, hint=""):
+        """Single entry point for background ops. Owns the busy lifecycle."""
+        if getattr(self, "_job_running", False):
             notify(tr("انتظر", "Please wait"),
                    tr("توجد عملية جارية حاليًا",
                       "An operation is already running"))
             return
+        self._job_running = True
+        self.busy = True
+        self.setIcon(make_icon(C_YELLOW, "…"))
+        self.setToolTip(hint or tr("جارٍ العمل...", "Working..."))
 
         def runner():
             try:
                 job()
             except Exception as e:
                 self.op_done.emit(tr("خطأ", "Error"), str(e))
+            finally:
+                if self.busy:
+                    self.busy = False
+                    self.kick_refresh()
 
         threading.Thread(target=runner, daemon=True).start()
 
@@ -1704,20 +1721,34 @@ class Tray(QSystemTrayIcon):
 
     def reconnect_one(self, target, serial=""):
         def job():
+            serial = serial or device_serial(target)
+            suspend_del(serial)
+            online = lambda: {d["serial"] for d in list_devices()
+                              if d["state"] == "device"}
             good = False
-            retries = max(1, int(S.get("max_retries")))
-            for _ in range(retries):
-                sh(["adb", "connect", target], 10)
+            for i in range(2):
+                self.busy_hint(f"{tr('محاولة', 'Attempt')} "
+                               f"{i + 1}/2 → {target}")
+                sh(["adb", "connect", target], 6)
                 time.sleep(1)
-                states = {d["serial"] for d in list_devices()
-                          if d["state"] == "device"}
-                if target in states:
+                if target in online():
                     good = True
                     break
+            if not good and serial:
+                t = mdns_target_for_serial(mdns_entries(), serial)
+                if t:
+                    self.busy_hint(f"mDNS → {t}")
+                    sh(["adb", "connect", t], 8)
+                    time.sleep(1)
+                    if t in online():
+                        good = True
+                        target = t
             if good:
                 suspend_del(serial)
+                model = next((d["model"] for d in list_devices()
+                              if d["serial"] == target), target)
                 save_cache_entry(serial or device_serial(target), target,
-                                 tr("جهاز", "device"))
+                                 model)
                 self.op_done.emit(tr("إعادة الاتصال", "Reconnect"),
                                   f"{tr('تم', 'Done')}: {target}")
             else:
@@ -1727,6 +1758,10 @@ class Tray(QSystemTrayIcon):
                        f"Failed {target} — check phone & network"))
         self.set_busy(True, f"{tr('إعادة اتصال', 'Reconnecting')}: {target}")
         self.run_job(job)
+
+    def busy_hint(self, text):
+        from PyQt5.QtCore import QTimer as _Q
+        _Q.singleShot(0, lambda: self.setToolTip(text) if self.busy else None)
 
     def remove_saved(self, target):
         drop_from_cache(target)
