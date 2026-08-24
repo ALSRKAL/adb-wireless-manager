@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QMenu, QMessageBox, QPushButton, QSpinBox,
                              QSystemTrayIcon, QVBoxLayout, QWidget)
 
-__version__ = "13.0.5"
+__version__ = "13.0.6"
 REPO = "ALSRKAL/adb-wireless-manager"
 REPO_URL = f"https://github.com/{REPO}"
 
@@ -299,15 +299,24 @@ def suspended_lines():
 def mdns_entries():
     out = sh(["adb", "mdns", "services"], 10)
     entries, seen = [], set()
+
+    def add(serial, target):
+        if target and target not in seen:
+            seen.add(target)
+            entries.append((serial.upper(), target))
+
     for line in out.splitlines():
-        if "_adb-tls-connect" not in line:
-            continue
-        m = re.search(
-            r"adb-([A-Za-z0-9]+)-[A-Za-z0-9]+\._adb-tls-connect"
-            r".*?(\S+:\d+)\s*$", line.strip())
-        if m and m.group(2) not in seen:
-            seen.add(m.group(2))
-            entries.append((m.group(1).upper(), m.group(2)))
+        if "_adb-tls-connect" in line:
+            m = re.search(
+                r"adb-([A-Za-z0-9]+)-[A-Za-z0-9]+\._adb-tls-connect"
+                r".*?(\S+:\d+)\s*$", line.strip())
+            if m:
+                add(m.group(1), m.group(2))
+        elif "_adb._tcp" in line:
+            m = re.search(r"adb-([A-Za-z0-9]+)", line)
+            a = re.search(r"(\S+:\d+)\s*$", line.strip())
+            if m and a:
+                add(m.group(1), a.group(1))
     return entries
 
 
@@ -933,6 +942,7 @@ class PairDialog(QDialog):
         tabs.addTab(qr_w, tr("QR يدوي", "Manual QR"))
 
         self._tabs = tabs
+        lay.addWidget(tabs)
         idx = {"scan": 0, "code": 1, "qr": 2}.get(start_tab, 0)
         tabs.setCurrentIndex(idx)
 

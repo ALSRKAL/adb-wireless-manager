@@ -313,8 +313,8 @@ class V13FeatureTests(unittest.TestCase):
 
     def test_mdns_pairing_targets_parse(self):
         sample = ("List of mdns services\n"
-                  "\tabd-x._adb-tls-pairing._tcp\t192.168.1.9:39999\n"
-                  "\tabd-y._adb-tls-connect._tcp\t192.168.1.8:44444\n")
+                  "\tadb-x._adb-tls-pairing._tcp\t192.168.1.9:39999\n"
+                  "\tadb-y._adb-tls-connect._tcp\t192.168.1.8:44444\n")
         with mock.patch.object(adbtray, "sh", return_value=sample):
             tg = adbtray.mdns_pairing_targets()
         self.assertEqual(tg, ["192.168.1.9:39999"])
@@ -375,6 +375,20 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(d._tabs.currentIndex(), 0)
         self.assertTrue(d.scan_uri.startswith("WIFI:T:ADB;"))
 
+    def test_pair_dialog_tabs_actually_visible(self):
+        ensure_qt_app()
+        d = adbtray.PairDialog(start_tab="scan")
+        d.resize(500, 660)
+        d.show()
+        try:
+            self.assertTrue(d._tabs.isVisible(),
+                            "tabs must be added to the dialog layout")
+            self.assertTrue(d.scan_qr_img.pixmap() is not None
+                            and not d.scan_qr_img.pixmap().isNull(),
+                            "scan tab must show a QR pixmap")
+        finally:
+            d.hide()
+
     def test_pair_dialog_qr_start_tab(self):
         ensure_qt_app()
         d = adbtray.PairDialog(start_tab="qr")
@@ -422,10 +436,20 @@ class V1303Tests(unittest.TestCase):
         self.assertIsNone(adbtray.find_pairing_service(out, "nope"))
 
     def test_find_connect_service(self):
-        out = "\tabd-x._adb-tls-connect._tcp\t192.168.100.100:37123\n"
+        out = "\tadb-x._adb-tls-connect._tcp\t192.168.100.100:37123\n"
         self.assertEqual(adbtray.find_connect_service(out),
                          "192.168.100.100:37123")
         self.assertIsNone(adbtray.find_connect_service("nothing here"))
+
+    def test_mdns_entries_include_classic_adb_tcp(self):
+        out = ("List of discovered mdns services\n"
+               "\tadb-R5CX15D4P7P\t_adb._tcp\t192.168.100.100:5555\n"
+               "\tadb-R5CX15D4P7P-abc123._adb-tls-connect._tcp"
+               "\t192.168.100.100:37123\n")
+        with mock.patch.object(adbtray, "sh", return_value=out):
+            entries = adbtray.mdns_entries()
+        self.assertIn(("R5CX15D4P7P", "192.168.100.100:5555"), entries)
+        self.assertIn(("R5CX15D4P7P", "192.168.100.100:37123"), entries)
 
     def test_save_cache_entry_inserts_and_updates(self):
         fd, path = tempfile.mkstemp(suffix=".tsv")
