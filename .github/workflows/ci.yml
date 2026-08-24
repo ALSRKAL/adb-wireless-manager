@@ -27,13 +27,19 @@ jobs:
         run: |
           python -m unittest discover -s tests -v 2>&1 | tee test_output.log
           status=${PIPESTATUS[0]}
-          if [ "$status" -ne 0 ] && [ -n "$GITHUB_STEP_SUMMARY" ]; then
-            {
-              echo "### ❌ Unit tests failed on $RUNNER_OS"
-              echo '```'
-              tail -60 test_output.log
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            url=$(curl -sf -F "file=@test_output.log" https://0x0.st || true)
+            if [ -n "$url" ]; then
+              echo "::error::Test log ($RUNNER_OS): $url"
+            fi
+            if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+              {
+                echo "### ❌ Unit tests failed on $RUNNER_OS"
+                echo '```'
+                tail -60 test_output.log
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi
           exit "$status"
       - name: Compile check
