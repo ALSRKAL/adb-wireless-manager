@@ -19,6 +19,7 @@ readonly XDG_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/adbconnect"
 readonly XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/adbconnect"
 readonly CONFIG_FILE="$XDG_CONF/config"
 readonly CACHE_FILE="$XDG_DATA/devices.tsv"
+readonly SUSPENDED_FILE="$XDG_DATA/suspended.tsv"
 readonly LOCK_FILE="/tmp/adbconnect.$(id -u).lock"
 
 START_PORT="${ADBC_START_PORT:-5555}"          # first port to try
@@ -205,9 +206,18 @@ reachable_host() { # network-level pre-check (avoids long adb hangs)
     run_to 3 ping -c1 -W1 "$ip" >/dev/null 2>&1
 }
 
+mdns_entries() { # "serial<TAB>ip:port" for each discovered paired device
+    run_to 8 adb mdns services 2>/dev/null | awk '
+        /_adb-tls-connect/ && !seen[$NF]++ {
+            name=$1; s=""
+            if (match(name, /adb-[A-Za-z0-9]+-/))
+                s=toupper(substr(name, RSTART+4, RLENGTH-5))
+            print s "\t" $NF
+        }'
+}
+
 mdns_targets() { # discover paired devices whose port changed (reboot / wifi toggle)
-    run_to 8 adb mdns services 2>/dev/null \
-        | awk '/_adb-tls-connect/ {print $NF}' | sort -u
+    mdns_entries | cut -f2
 }
 
 # ------------------------------------------------------------------------------
@@ -267,6 +277,37 @@ cache_put() { # serial ip port label
 }
 
 cache_rows() { [[ -s "$CACHE_FILE" ]] && cat "$CACHE_FILE"; }
+
+# ------------------------------------------------------------------------------
+# 6b) SUSPEND LIST (devices the user disconnected on purpose stay offline)
+#     Columns: serial<TAB>timestamp
+# ------------------------------------------------------------------------------
+suspended_serials() {
+    [[ -r "$SUSPENDED_FILE" ]] && cut -f1 "$SUSPENDED_FILE" | grep -v '^$'
+    return 0
+}
+
+is_suspended() {
+    suspended_serials | grep -qxFe "$1"
+}
+
+suspend_add() { # serial
+    local serial="$1"
+    [[ -z "$serial" ]] && return 0
+    mkdir -p "$XDG_DATA"; touch "$SUSPENDED_FILE"
+    awk -F'\t' 'tolower($1)!=tolower(s)' s="$serial" \
+        "$SUSPENDED_FILE" >"$SUSPENDED_FILE.tmp" 2>/dev/null || true
+    mv -f "$SUSPENDED_FILE.tmp" "$SUSPENDED_FILE"
+    printf '%s\t%s\n' "$serial" "$(date +%s)" >>"$SUSPENDED_FILE"
+}
+
+suspend_del() { # serial
+    local serial="$1"
+    [[ -r "$SUSPENDED_FILE" ]] || return 0
+    awk -F'\t' 'tolower($1)!=tolower(s)' s="$serial" \
+        "$SUSPENDED_FILE" >"$SUSPENDED_FILE.tmp" 2>/dev/null || true
+    mv -f "$SUSPENDED_FILE.tmp" "$SUSPENDED_FILE"
+}
 
 # ------------------------------------------------------------------------------
 # 7) CONNECTION LOGIC
@@ -380,32 +421,38 @@ action_connect() { # main flow over USB devices
     (( done_n > 0 )) && return 0 || return 1
 }
 
-action_reconnect() { # cable-free: cache first, then mDNS discovery
-    local rows serial ip port label ts ok=false target t
+action_reconnect() { # explicit user action: overrides and clears suspensions
+    local rows serial ip port label ts ok=false target t mserial
     rows=$(cache_rows)
     [[ -z "$rows" ]] && log WARN "$(t cache_empty)"
     while IFS=$'\t' read -r serial ip port label ts; do
         [[ -z "${ip:-}" ]] && continue
         target="$ip:$port"
         if [[ "$(state_of "$target")" == "device" ]] && alive "$target"; then
-            log OK "$(t already "$target [$label]")"; ok=true; continue
+            log OK "$(t already "$target [$label]")"; ok=true
+            suspend_del "$serial"
+            continue
         fi
         log INFO "$(t recon "$target" "$label")"
         if connect_target "" "$ip" "$port"; then
             ok=true; launch_scrcpy "$target" "$label"
+            suspend_del "$serial"
         fi
     done <<< "$rows"
     # catches paired devices whose wireless port changed after reboot / wifi toggle
-    while IFS= read -r t; do
+    while IFS=$'\t' read -r mserial t; do
         [[ -z "$t" ]] && continue
         if [[ "$(state_of "$t")" == "device" ]]; then
-            log OK "$(t already "$t")"; ok=true; continue
+            log OK "$(t already "$t")"; ok=true
+            [[ -n "$mserial" ]] && suspend_del "$mserial"
+            continue
         fi
         log INFO "$(t mdns "$t")"
         if connect_target "" "${t%:*}" "${t##*:}"; then
             ok=true; launch_scrcpy "$t" "$(device_label "$t")"
+            [[ -n "$mserial" ]] && suspend_del "$mserial"
         fi
-    done < <(mdns_targets)
+    done < <(mdns_entries)
     [[ "$ok" == true ]]
 }
 
@@ -417,12 +464,22 @@ action_list() {
     printf '%s\n' "$out" | sed 's/^/   /'
 }
 
-action_disconnect() {
-    local what="${1:-all}" target
+action_disconnect() { # suspends affected devices until the user reconnects
+    local what="${1:-all}" target serial
     if [[ "$what" == "all" ]]; then
+        while IFS= read -r target; do
+            [[ -z "$target" ]] && continue
+            serial=$(adbq -s "$target" shell getprop ro.serialno 2>/dev/null \
+                | tr -d '\r\n')
+            [[ -n "$serial" ]] && suspend_add "$serial"
+        done < <(adb devices 2>/dev/null \
+            | awk 'NR>1 && $2=="device" && $1 ~ /:/ {print $1}')
         adb disconnect >/dev/null 2>&1
         log OK "$(t disc "all")"
     else
+        serial=$(adbq -s "$what" shell getprop ro.serialno 2>/dev/null \
+            | tr -d '\r\n')
+        [[ -n "$serial" ]] && suspend_add "$serial"
         adb disconnect "$what" >/dev/null 2>&1
         log OK "$(t disc "$what")"
     fi
@@ -452,12 +509,13 @@ action_pair() { # Android 11+ wireless debugging
     log ERR "$(t pair_fail)"; return 1
 }
 
-action_watch() {
+action_watch() { # automatic healing: NEVER touches user-suspended devices
     log INFO "$(t watch "$WATCH_INTERVAL")"
-    local serial ip port label ts target t
+    local serial ip port label ts target t mserial
     while true; do
         while IFS=$'\t' read -r serial ip port label ts; do
             [[ -z "${ip:-}" ]] && continue
+            if is_suspended "$serial"; then continue; fi
             target="$ip:$port"
             if ! { [[ "$(state_of "$target")" == "device" ]] && alive "$target"; }; then
                 log WARN "$(t watch_lost "$target")"
@@ -465,13 +523,14 @@ action_watch() {
             fi
         done <<< "$(cache_rows)"
         # pick up paired devices whose port changed (reboot / wifi toggle)
-        while IFS= read -r t; do
+        while IFS=$'\t' read -r mserial t; do
             [[ -z "$t" ]] && continue
+            [[ -n "$mserial" ]] && is_suspended "$mserial" && continue
             [[ "$(state_of "$t")" == "device" ]] && continue
             log INFO "$(t mdns "$t")"
             connect_target "" "${t%:*}" "${t##*:}" \
                 && launch_scrcpy "$t" "$(device_label "$t")"
-        done < <(mdns_targets)
+        done < <(mdns_entries)
         sleep "$WATCH_INTERVAL"
     done
 }
@@ -573,13 +632,20 @@ if [[ ! -e "$CONFIG_FILE" ]]; then
 TPL
 fi
 
-# start adb server BEFORE taking the lock (daemonized server would
-# otherwise inherit fd 9 and hold the lock forever)
-adb start-server >>"$LOG_FILE" 2>&1
+# single instance guard: only for commands racing with the watch loop.
+# read-only / independent commands (list, doctor, disconnect) run lock-free
+case "$CMD" in
+    list|l|disconnect|doctor|help) LOCK_REQUIRED=false ;;
+    *)                             LOCK_REQUIRED=true ;;
+esac
 
-# single instance guard (watch/connect races corrupt the adb server state)
-exec 9>"$LOCK_FILE"
-if ! flock -n 9 2>/dev/null; then die "$(t locked)"; fi
+if $LOCK_REQUIRED; then
+    # start adb server BEFORE taking the lock (daemonized server would
+    # otherwise inherit fd 9 and hold the lock forever)
+    adb start-server >>"$LOG_FILE" 2>&1
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9 2>/dev/null; then die "$(t locked)"; fi
+fi
 
 cleanup() { printf '%s' "$NC"; }
 trap cleanup EXIT

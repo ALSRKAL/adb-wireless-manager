@@ -23,6 +23,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 
 $script:DataDir = Join-Path $env:APPDATA 'adbconnect'
 $script:CacheFile = Join-Path $script:DataDir 'devices.tsv'
+$script:SuspendFile = Join-Path $script:DataDir 'suspended.tsv'
 $script:LogFile = Join-Path $env:TEMP 'adbconnect.log'
 
 function Write-Log([string]$Level, [string]$Message) {
@@ -62,7 +63,9 @@ function Get-CachedTargets {
         foreach ($line in Get-Content $script:CacheFile) {
             $c = $line -split "`t"
             if ($c.Count -ge 4) {
-                $rows += , @("$($c[1]):$($c[2])", $c[3].Replace('_', ' '))
+                $rows += , @("$($c[1]):$($c[2])",
+                             $c[3].Replace('_', ' '),
+                             $c[0].ToUpper())
             }
         }
     }
@@ -85,15 +88,46 @@ function Add-CacheEntry([string]$Serial, [string]$Ip, [int]$P,
     Set-Content -Path $script:CacheFile -Value $kept -Encoding UTF8
 }
 
-function Get-MdnsTargets {
-    $out = adb mdns services 2>$null
-    $targets = @()
-    foreach ($line in $out) {
-        if ($line -match '_adb-tls-connect' -and $line -match '(\S+:\d+)\s*$') {
-            $targets += $Matches[1]
+function Get-Suspended {
+    $list = @()
+    if (Test-Path $script:SuspendFile) {
+        foreach ($line in Get-Content $script:SuspendFile) {
+            $s = ($line -split "`t")[0]
+            if ($s) { $list += $s.ToUpper() }
         }
     }
-    return $targets | Sort-Object -Unique
+    return $list
+}
+
+function Suspend-Device([string]$Serial) {
+    if (-not $Serial) { return }
+    New-Item -ItemType Directory -Force -Path $script:DataDir | Out-Null
+    $keep = @(Get-Suspended | Where-Object { $_ -ne $Serial.ToUpper() })
+    $keep += $Serial.ToUpper()
+    Set-Content -Path $script:SuspendFile -Value $keep -Encoding UTF8
+}
+
+function Resume-Device([string]$Serial) {
+    if (-not $Serial -or -not (Test-Path $script:SuspendFile)) { return }
+    $keep = @(Get-Suspended | Where-Object { $_ -ne $Serial.ToUpper() })
+    Set-Content -Path $script:SuspendFile -Value $keep -Encoding UTF8
+}
+
+function Get-MdnsEntries {
+    $out = adb mdns services 2>$null
+    $rows = @()
+    foreach ($line in $out) {
+        if ($line -match 'adb-([A-Za-z0-9]+)-[A-Za-z0-9]+\._adb-tls-connect' -and
+            $line -match '(\S+:\d+)\s*$') {
+            $rows += , @($Matches[1].ToUpper(), $Matches[2])
+        }
+    }
+    return $rows
+}
+
+function Get-MdnsTargets {
+    return (Get-MdnsEntries | ForEach-Object { $_[1] }) |
+        Sort-Object -Unique
 }
 
 function Get-PhoneIps([string]$Serial) {
@@ -168,38 +202,62 @@ function Invoke-ConnectUsb {
 }
 
 function Invoke-Reconnect {
+    [CmdletBinding()]
+    param([switch]$Auto)
+
     $targets = @(Get-CachedTargets)
-    $mdns = Get-MdnsTargets | Where-Object {
-        $t = $_; -not ($targets | Where-Object { $_[0] -eq $t }) }
-    foreach ($m in $mdns) { $targets += , @($m, 'mDNS') }
+    $knownTargets = $targets | ForEach-Object { $_[0] }
+    foreach ($m in (Get-MdnsEntries)) {
+        if ($knownTargets -notcontains $m[1]) {
+            $targets += , @($m[1], 'mDNS', $m[0])
+        }
+    }
+
+    $suspended = @(Get-Suspended)
     if ($targets.Count -eq 0) {
         Write-Log 'WARN' 'No saved devices. Plug a device via USB and run once.'
         return
     }
     foreach ($entry in $targets) {
-        $t = $entry[0]; $label = $entry[1]
+        $t = $entry[0]
+        $label = if ($entry.Count -gt 1) { $entry[1] } else { 'mDNS' }
+        $serial = if ($entry.Count -gt 2) { $entry[2] } else { '' }
+        if ($Auto -and $serial -and $suspended -contains $serial.ToUpper()) {
+            continue
+        }
         if (Test-TargetConnected $t) {
             Write-Log 'OK' "Already connected: $t [$label]"
+            Resume-Device $serial
             continue
         }
         Write-Log 'INFO' "Reconnecting saved device: $t ($label)"
-        if (Connect-Target $t $Retries) { Invoke-Scrcpy $t $label }
-        else { Write-Log 'ERR' "Failed: $t" }
+        if (Connect-Target $t $Retries) {
+            Invoke-Scrcpy $t $label
+            Resume-Device $serial
+        } else {
+            Write-Log 'ERR' "Failed: $t"
+        }
     }
 }
 
 function Invoke-WatchLoop {
     Write-Log 'INFO' "Watching every ${WatchInterval}s (Ctrl+C to stop)..."
     while ($true) {
-        Invoke-Reconnect
+        Invoke-Reconnect -Auto
         Start-Sleep -Seconds $WatchInterval
     }
 }
 
 function Invoke-Disconnect([string]$What = 'all') {
+    foreach ($d in (Get-DeviceList)) {
+        if ($d.State -eq 'device' -and -not $d.Usb) {
+            $sn = adb -s $d.Serial shell getprop ro.serialno 2>$null
+            Suspend-Device ("$sn").Trim()
+        }
+    }
     if ($What -eq 'all') { $null = adb disconnect 2>&1 }
     else { $null = adb disconnect $What 2>&1 }
-    Write-Log 'OK' "Disconnected: $What"
+    Write-Log 'OK' "Disconnected: $What (stays off until you reconnect)"
 }
 
 function Show-List {

@@ -140,6 +140,68 @@ class PortTests(unittest.TestCase):
             self.assertEqual(adbtray.next_free_port(5555), 5555)
 
 
+class SuspendTests(unittest.TestCase):
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".tsv")
+        os.close(fd)
+        self._orig = adbtray.SUSPENDED_FILE
+        adbtray.SUSPENDED_FILE = self.path
+
+    def tearDown(self):
+        adbtray.SUSPENDED_FILE = self._orig
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    def test_add_list_clear_roundtrip(self):
+        self.assertEqual(adbtray.suspended_serials(), [])
+        adbtray.suspend_add("R5CX15D4P7P")
+        self.assertTrue(adbtray.is_suspended("R5CX15D4P7P"))
+        adbtray.suspend_add("RZCN8017T9E")
+        self.assertEqual(len(adbtray.suspended_serials()), 2)
+        adbtray.suspend_del("R5CX15D4P7P")
+        self.assertFalse(adbtray.is_suspended("R5CX15D4P7P"))
+        self.assertTrue(adbtray.is_suspended("RZCN8017T9E"))
+
+    def test_add_same_serial_no_duplicates(self):
+        adbtray.suspend_add("SER1")
+        adbtray.suspend_add("SER1")
+        self.assertEqual(adbtray.suspended_serials(), ["SER1"])
+
+    def test_case_insensitive_matching(self):
+        adbtray.suspend_add("serial1")
+        self.assertTrue(adbtray.is_suspended("SERIAL1"))
+
+    def test_empty_serial_is_ignored(self):
+        adbtray.suspend_add("")
+        self.assertFalse(adbtray.is_suspended(""))
+
+
+class MdnsEntryTests(unittest.TestCase):
+    def test_entries_include_serial_and_target(self):
+        with mock.patch.object(adbtray, "sh", return_value=MDNS_SAMPLE):
+            entries = adbtray.mdns_entries()
+        pairs = {t: s for s, t in entries}
+        self.assertEqual(pairs["192.168.100.100:37123"], "R5CX15D4P7P")
+        self.assertEqual(pairs["192.168.100.65:44115"], "RZCN8017T9E")
+
+    def test_cached_entries_include_serial(self):
+        fd, path = tempfile.mkstemp(suffix=".tsv")
+        os.close(fd)
+        orig = adbtray.CACHE_FILE
+        adbtray.CACHE_FILE = path
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("MY serial\t10.0.0.9\t5555\tNexus\t123\n")
+            rows = adbtray.cached_entries()
+            self.assertEqual(rows[0][0], "MY serial".upper().replace(
+                "MY SERIAL", "MY serial"))
+            self.assertEqual(rows[0][1], "10.0.0.9:5555")
+            self.assertEqual(rows[0][2], "Nexus")
+        finally:
+            adbtray.CACHE_FILE = orig
+            os.unlink(path)
+
+
 class PlatformTests(unittest.TestCase):
     def test_data_dir_contains_app_folder(self):
         self.assertTrue(adbtray.data_dir().endswith("adbconnect"))

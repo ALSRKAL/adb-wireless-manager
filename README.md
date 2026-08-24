@@ -24,6 +24,7 @@ once**, survives network drops, laptop reboots, and even phone reboots
 | 📱 | Multi-device support (connect many phones together) | ✅ | ✅ |
 | 🖥️ | Screen mirroring via scrcpy per device | ✅ | — |
 | 📴 | Offline devices stay visible with a per-device reconnect button | ✅ | — |
+| 🚫 | Manual suspend: a device you disconnect stays offline until *you* reconnect it (watch/auto-heal skips it) | ✅ | ✅ |
 | 🩺 | Environment doctor (adb / scrcpy / mDNS / network) | ✅ | ✅ |
 | 🟢 | Live tray status icon (green = connected, red = none, yellow = busy) | ✅ | — |
 

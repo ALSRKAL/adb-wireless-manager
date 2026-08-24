@@ -39,6 +39,7 @@ def data_dir():
 
 
 CACHE_FILE = os.path.join(data_dir(), "devices.tsv")
+SUSPENDED_FILE = os.path.join(data_dir(), "suspended.tsv")
 
 
 def log_file():
@@ -97,28 +98,91 @@ def list_devices():
 
 
 def cached_targets():
+    return [(t, lbl) for _, t, lbl in cached_entries()]
+
+
+def cached_entries():
     rows = []
     try:
         with open(CACHE_FILE, encoding="utf-8") as f:
             for line in f:
                 c = line.rstrip("\n").split("\t")
                 if len(c) >= 4:
-                    rows.append((c[1] + ":" + c[2], c[3].replace("_", " ")))
+                    rows.append((c[0], c[1] + ":" + c[2],
+                                 c[3].replace("_", " ")))
     except OSError:
         pass
     return rows
 
 
+def suspended_serials():
+    out = []
+    try:
+        with open(SUSPENDED_FILE, encoding="utf-8") as f:
+            for line in f:
+                s = line.split("\t")[0].strip()
+                if s:
+                    out.append(s)
+    except OSError:
+        pass
+    return out
+
+
+def is_suspended(serial):
+    return serial.upper() in {s.upper() for s in suspended_serials()}
+
+
+def suspend_add(serial):
+    if not serial:
+        return
+    try:
+        os.makedirs(os.path.dirname(SUSPENDED_FILE), exist_ok=True)
+        keep = [l for l in suspended_lines()
+                if l.split("\t")[0].strip().upper() != serial.upper()]
+        keep.append(f"{serial}\t{int(time.time())}\n")
+        with open(SUSPENDED_FILE, "w", encoding="utf-8") as f:
+            f.writelines(keep)
+    except OSError:
+        pass
+
+
+def suspend_del(serial):
+    if not serial:
+        return
+    try:
+        keep = [l for l in suspended_lines()
+                if l.split("\t")[0].strip().upper() != serial.upper()]
+        with open(SUSPENDED_FILE, "w", encoding="utf-8") as f:
+            f.writelines(keep)
+    except OSError:
+        pass
+
+
+def suspended_lines():
+    try:
+        with open(SUSPENDED_FILE, encoding="utf-8") as f:
+            return [l for l in f.readlines() if l.strip()]
+    except OSError:
+        return []
+
+
 def mdns_targets():
+    return [t for _, t in mdns_entries()]
+
+
+def mdns_entries():
     out = sh(["adb", "mdns", "services"], 10)
-    tg = []
+    entries, seen = [], set()
     for line in out.splitlines():
         if "_adb-tls-connect" not in line:
             continue
-        m = re.search(r"(\S+:\d+)\s*$", line.strip())
-        if m:
-            tg.append(m.group(1))
-    return sorted(set(tg))
+        m = re.search(
+            r"adb-([A-Za-z0-9]+)-[A-Za-z0-9]+\._adb-tls-connect"
+            r".*?(\S+:\d+)\s*$", line.strip())
+        if m and m.group(2) not in seen:
+            seen.add(m.group(2))
+            entries.append((m.group(1).upper(), m.group(2)))
+    return entries
 
 
 def port_busy(p):
@@ -154,6 +218,17 @@ def phone_ips(serial):
             continue
         (wlan if "wlan" in line else other).append(ip)
     return wlan + other
+
+
+def device_serial(target):
+    out = sh(["adb", "-s", target, "shell",
+              "getprop", "ro.serialno"], 6).strip()
+    if out:
+        return out.upper()
+    for mserial, t in mdns_entries():
+        if t == target:
+            return mserial
+    return ""
 
 
 def scrcpy_running(target):
@@ -319,11 +394,11 @@ class Tray(QSystemTrayIcon):
         online = [d for d in self.devices if d["state"] == "device"]
         bad = [d for d in self.devices if d["state"] != "device"]
         connected = {d["serial"] for d in self.devices}
-        offline = [(t, lbl) for t, lbl in cached_targets()
+        offline = [(s, t, lbl) for s, t, lbl in cached_entries()
                    if t not in connected]
-        for t in mdns_targets():
-            if t not in connected and t not in {x for x, _ in offline}:
-                offline.append((t, "mDNS"))
+        for mserial, t in mdns_entries():
+            if (t not in connected and t not in {x for _, x, _ in offline}):
+                offline.append((mserial, t, "mDNS"))
 
         if not online and not bad and not offline:
             a = self.menu.addAction("لا توجد أجهزة | No devices")
@@ -341,11 +416,15 @@ class Tray(QSystemTrayIcon):
             s2.triggered.connect(lambda _, t=d["serial"]: self.drop_one(t))
             self._add(a)
 
-        for t, lbl in offline:
-            sub = QMenu(f"📴 {lbl} — غير متصل ({t})", self.menu)
+        for sserial, t, lbl in offline:
+            if is_suspended(sserial):
+                sub = QMenu(f"🚫 {lbl} — موقوف بواسطتك ({t})", self.menu)
+            else:
+                sub = QMenu(f"📴 {lbl} — غير متصل ({t})", self.menu)
             a = self.menu.addMenu(sub)
             r1 = sub.addAction("🔄  إعادة الاتصال الآن | Reconnect now")
-            r1.triggered.connect(lambda _, tt=t: self.reconnect_one(tt))
+            r1.triggered.connect(lambda _, tt=t, ss=sserial:
+                                 self.reconnect_one(tt, ss))
             r2 = sub.addAction("🗑️  حذف من المحفوظات | Forget device")
             r2.triggered.connect(lambda _, tt=t: self.remove_saved(tt))
             self._add(a)
@@ -381,15 +460,16 @@ class Tray(QSystemTrayIcon):
             self.op_refresh.emit()
             connected_now = {d["serial"] for d in list_devices()
                              if d["state"] == "device"}
-            targets = cached_targets()
-            known = {t for t, _ in targets}
-            for t in mdns_targets():
+            targets = [(s, t, lbl) for s, t, lbl in cached_entries()]
+            known = {t for _, t, _ in targets}
+            for mserial, t in mdns_entries():
                 if t not in known:
-                    targets.append((t, "mDNS"))
+                    targets.append((mserial, t, "mDNS"))
             ok, fail = [], []
-            for t, label in targets:
+            for serial, t, label in targets:
                 if t in connected_now:
                     ok.append(label)
+                    suspend_del(serial)
                     continue
                 good = False
                 for _ in range(2):
@@ -399,7 +479,11 @@ class Tray(QSystemTrayIcon):
                              if d["state"] == "device"}:
                         good = True
                         break
-                (ok if good else fail).append(f"{label} ({t})")
+                if good:
+                    suspend_del(serial)
+                    ok.append(f"{label} ({t})")
+                else:
+                    fail.append(f"{label} ({t})")
             msg = ""
             if ok:
                 msg += "تم الاتصال: " + "، ".join(ok)
@@ -446,18 +530,30 @@ class Tray(QSystemTrayIcon):
 
     def disconnect_all(self):
         def job():
+            for d in list_devices():
+                if d["state"] == "device" and not d["usb"]:
+                    serial = device_serial(d["serial"])
+                    suspend_add(serial)
             sh(["adb", "disconnect"], 8)
-            self.op_done.emit("فصل الاتصالات", "تم فصل جميع الاتصالات اللاسلكية")
+            self.op_done.emit(
+                "فصل الاتصالات",
+                "تم فصل الجميع — لن يعودوا تلقائيًا حتى تعيدوا من القائمة")
             self.op_refresh.emit()
         self.run_job(job)
 
     def drop_one(self, target):
         def job():
+            serial = device_serial(target)
+            suspend_add(serial)
             sh(["adb", "disconnect", target], 8)
+            name = next((d["model"] for d in list_devices()
+                         if d["serial"] == target), target)
+            notify("فصل مؤقت",
+                   f"{name} معلّق ولن يعود تلقائيًا — أعده من القائمة 🚫")
             self.op_refresh.emit()
         self.run_job(job)
 
-    def reconnect_one(self, target):
+    def reconnect_one(self, target, serial=""):
         def job():
             good = False
             for _ in range(3):
@@ -469,6 +565,7 @@ class Tray(QSystemTrayIcon):
                     good = True
                     break
             if good:
+                suspend_del(serial)
                 self.op_done.emit("إعادة الاتصال", f"تم: {target}")
             else:
                 self.op_done.emit(
