@@ -500,10 +500,6 @@ class V1303Tests(unittest.TestCase):
             _sh.rmtree(fd_dir, ignore_errors=True)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class OpGateTests(unittest.TestCase):
     """The operation gate must never stick: expiry, queue, watchdog."""
 
@@ -581,6 +577,187 @@ class OpGateTests(unittest.TestCase):
         self.assertTrue(t.busy)
         t.on_busy_release(None)
         self.assertFalse(t.busy)
+
+
+class V13013Tests(unittest.TestCase):
+    """APK install UX: error mapping, drop filtering, progress dialog."""
+
+    def test_friendly_error_success_is_empty(self):
+        self.assertEqual(adbtray.friendly_adb_error("Success"), "")
+        self.assertEqual(
+            adbtray.friendly_adb_error("Performing Streamed Install\nSuccess"),
+            "")
+
+    def test_friendly_error_storage_full(self):
+        msg = adbtray.friendly_adb_error(
+            "INSTALL_FAILED_INSUFFICIENT_STORAGE")
+        self.assertTrue(msg)
+
+    def test_friendly_error_signature(self):
+        out = "INSTALL_FAILED_UPDATE_INCOMPATIBLE: package signatures"
+        msg = adbtray.friendly_adb_error(out)
+        self.assertTrue(msg)
+        self.assertNotIn("unknown", msg.lower())
+
+    def test_friendly_error_downgrade(self):
+        self.assertTrue(
+            adbtray.friendly_adb_error("INSTALL_FAILED_VERSION_DOWNGRADE"))
+
+    def test_friendly_error_cancelled_on_device(self):
+        self.assertTrue(
+            adbtray.friendly_adb_error("Install canceled by user"))
+
+    def test_friendly_error_invalid_apk(self):
+        self.assertTrue(
+            adbtray.friendly_adb_error("INSTALL_FAILED_INVALID_APK"))
+
+    def test_friendly_error_offline(self):
+        self.assertTrue(adbtray.friendly_adb_error("error: device offline"))
+
+    def test_friendly_error_device_not_found(self):
+        out = "adb: error: failed to get feature set: " \
+              "device 'R5CX15D4P7P' not found"
+        self.assertTrue(adbtray.friendly_adb_error(out))
+
+    def test_friendly_error_unknown_keeps_raw_line(self):
+        out = "adb: some totally novel failure"
+        msg = adbtray.friendly_adb_error(out)
+        self.assertIn("some totally novel failure", msg)
+
+    def test_friendly_error_missing_file(self):
+        out = "adb: failed to stat /path/with spaces/app.apk: " \
+              "No such file or directory"
+        msg = adbtray.friendly_adb_error(out)
+        self.assertIn("app.apk", msg)
+
+    def test_run_one_missing_file_reports_error(self):
+        """A vanished/moved APK must fail gracefully, not crash."""
+        ensure_qt_app()
+        t = adbtray.Tray()
+        msgs = []
+        t.op_done.connect(lambda title, msg: msgs.append(msg))
+        fake_dev = {"serial": "SERX", "model": "m", "state": "device"}
+        missing = "/tmp/definitely_gone_%d.apk" % time.time_ns()
+        with mock.patch.object(adbtray.subprocess, "Popen",
+                               side_effect=FileNotFoundError("adb")):
+            t._do_install([missing], fake_dev)
+            from PyQt5.QtWidgets import QApplication
+            deadline = time.time() + 5
+            while not msgs and time.time() < deadline:
+                QApplication.processEvents()
+                time.sleep(0.02)
+        self.assertTrue(msgs, "must report even when the file is gone")
+        self.assertIn(os.path.basename(missing), "\n".join(msgs))
+
+    def test_install_progress_dialog_flow(self):
+        ensure_qt_app()
+        from PyQt5.QtWidgets import QApplication
+        dlg = adbtray.InstallProgressDialog(3, "t")
+        dlg.show()
+        self.assertFalse(dlg.cancel_requested())
+        dlg.step_changed.emit("app.apk", 1)
+        QApplication.processEvents()
+        self.assertEqual(dlg.bar.value(), 1)
+        self.assertIn("app.apk", dlg.file_label.text())
+        dlg.request_cancel()
+        self.assertTrue(dlg.cancel_requested())
+        self.assertFalse(dlg.cancel_btn.isEnabled())
+        # finish must close via the queued signal, not fake the bar
+        bar_before = dlg.bar.value()
+        dlg.finish()
+        QApplication.processEvents()
+        self.assertEqual(dlg.bar.value(), bar_before)
+
+    def test_do_install_reports_reasons_and_skips(self):
+        ensure_qt_app()
+        from PyQt5.QtWidgets import QApplication
+        t = adbtray.Tray()
+        msgs = []
+        t.op_done.connect(lambda title, msg: msgs.append(msg))
+        fake_dev = {"serial": "SERX", "model": "m", "state": "device"}
+
+        class FakeProc:
+            def __init__(self, out):
+                self._out = out
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        good = FakeProc("Success\n")
+        bad = FakeProc("INSTALL_FAILED_INSUFFICIENT_STORAGE\n")
+
+        def fake_popen(cmd, stdout=None, stderr=None, stdin=None):
+            return bad if "bad.apk" in cmd else good
+
+        with mock.patch.object(adbtray.subprocess, "Popen",
+                               side_effect=fake_popen):
+            t._do_install(["/tmp/good.apk", "/tmp/bad.apk"], fake_dev,
+                          rejected=["notes.txt"])
+            deadline = time.time() + 5
+            while not msgs and time.time() < deadline:
+                QApplication.processEvents()
+                time.sleep(0.02)
+        self.assertTrue(msgs, "install must report a result")
+        joined = "\n".join(msgs)
+        self.assertIn("good.apk", joined)
+        self.assertIn("bad.apk", joined)
+
+    def test_do_install_while_busy_never_orphans_dialog(self):
+        """Queued install must not flash a dialog before it runs."""
+        ensure_qt_app()
+        from PyQt5.QtWidgets import QApplication
+        t = adbtray.Tray()
+        release = []
+
+        def holder():  # occupies the gate like a real running operation
+            time.sleep(1.0)
+            release.append(1)
+
+        t.run_job(holder, blocking=True, timeout=30)
+        fake_dev = {"serial": "SERX", "model": "m", "state": "device"}
+        install_calls = []
+
+        def counting(*args, **kwargs):
+            cmd = list(args[0])
+            if len(cmd) >= 5 and cmd[3] == "install":
+                install_calls.append(cmd)
+            proc = mock.MagicMock()
+            proc.poll.return_value = 0
+            proc.wait.return_value = 0
+            return proc
+
+        with mock.patch.object(adbtray.subprocess, "Popen",
+                               side_effect=counting):
+            t._do_install(["/tmp/x.apk"], fake_dev)
+            QApplication.processEvents()
+            # run_job queued it (busy) — preflight must have skipped show()
+            self.assertIsNotNone(t._queued)
+            deadline = time.time() + 8
+            while not release and time.time() < deadline:
+                QApplication.processEvents()
+                time.sleep(0.02)
+            # after the holder finishes, queued install runs for real
+            deadline = time.time() + 8
+            while not install_calls and time.time() < deadline:
+                QApplication.processEvents()
+                time.sleep(0.02)
+            # pump a little longer to catch any double execution
+            t0 = time.time()
+            while time.time() - t0 < 1.0:
+                QApplication.processEvents()
+                time.sleep(0.02)
+        self.assertEqual(len(install_calls), 1,
+                         f"queued install must execute exactly once, "
+                         f"got {len(install_calls)}")
 
 
 if __name__ == "__main__":

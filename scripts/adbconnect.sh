@@ -9,7 +9,7 @@
 set -uo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="13.0.10"
+readonly VERSION="13.0.13"
 readonly SCRIPT_NAME="${0##*/}"
 
 # ------------------------------------------------------------------------------
@@ -561,7 +561,9 @@ action_watch() { # automatic healing: NEVER touches user-suspended devices
             target="$ip:$port"
             if ! { [[ "$(state_of "$target")" == "device" ]] && alive "$target"; }; then
                 log WARN "$(t watch_lost "$target")"
-                connect_target "" "$ip" "$port" && launch_scrcpy "$target" "$label"
+                # heal silently: auto-launching a mirror window from a
+                # background loop is intrusive — scrcpy stays on-demand
+                connect_target "" "$ip" "$port"
             fi
         done <<< "$(cache_rows)"
         # pick up paired devices whose port changed (reboot / wifi toggle)
@@ -571,7 +573,6 @@ action_watch() { # automatic healing: NEVER touches user-suspended devices
             [[ "$(state_of "$t")" == "device" ]] && continue
             log INFO "$(t mdns "$t")"
             if connect_target "" "${t%:*}" "${t##*:}"; then
-                launch_scrcpy "$t" "$(device_label "$t")"
                 [[ -n "$mserial" ]] && cache_put "$mserial" \
                     "${t%:*}" "${t##*:}" "$(device_label "$t")"
             fi

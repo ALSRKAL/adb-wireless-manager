@@ -100,7 +100,7 @@ if $WITH_TRAY; then
 Type=Application
 Name=ADB Wireless Tray
 Comment=ADB Wireless Manager tray icon and menu
-Exec=$(command -v python3 || echo /usr/bin/python3) $TRAY
+Exec="$(command -v python3 || echo /usr/bin/python3)" "$TRAY"
 Terminal=false
 Categories=Utility;Network;
 Icon=phone
@@ -120,7 +120,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$(command -v bash || echo /bin/bash) $CLI watch
+ExecStart=$(command -v bash || echo /bin/bash) "$CLI" watch
 Restart=on-failure
 RestartSec=15
 

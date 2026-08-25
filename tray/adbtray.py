@@ -23,10 +23,10 @@ from PyQt5.QtGui import QColor, QCursor, QFont, QIcon, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QFileDialog, QFormLayout, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit,
-                             QMenu, QMessageBox, QPushButton, QSpinBox,
-                             QSystemTrayIcon, QVBoxLayout, QWidget)
+                             QMenu, QMessageBox, QProgressBar, QPushButton,
+                             QSpinBox, QSystemTrayIcon, QVBoxLayout, QWidget)
 
-__version__ = "13.0.11"
+__version__ = "13.0.13"
 REPO = "ALSRKAL/adb-wireless-manager"
 REPO_URL = f"https://github.com/{REPO}"
 
@@ -605,6 +605,106 @@ def is_apk(path):
     return str(path).lower().endswith(".apk")
 
 
+def friendly_adb_error(output):
+    """Translate raw `adb install` output into a human-readable reason."""
+    out = (output or "").lower()
+    if "success" in out:
+        return ""
+    if "insufficient_storage" in out or "not enough space" in out \
+            or "no space left" in out:
+        return tr("مساحة التخزين ممتلئة على الجهاز",
+                  "Device storage is full")
+    if "install_failed_version_downgrade" in out:
+        return tr("نسخة أقدم من المثبتة حاليًا — احذف القديم أولًا",
+                  "older than the installed one — uninstall first")
+    if "install_failed_already_exists" in out:
+        return tr("نفس النسخة مثبتة مسبقًا",
+                  "the same version is already installed")
+    if "incompatible" in out:
+        return tr("التطبيق غير متوافق مع هذا الجهاز",
+                  "app is incompatible with this device")
+    if "signature" in out or "update_ownership" in out:
+        return tr("توقيع مختلف عن النسخة المثبتة — احذف القديم أولًا",
+                  "different signature than the installed "
+                  "copy — uninstall first")
+    if "install_canceled_by_user" in out or "cancelled" in out \
+            or "canceled" in out:
+        return tr("أُلغي التثبيت من الجهاز (وافق على النافذة على الشاشة)",
+                  "cancelled on the device (accept the prompt on screen)")
+    if "install_failed_invalid_apk" in out or "corrupt" in out:
+        return tr("ملف APK تالف أو غير صالح", "APK file is corrupt/invalid")
+    if "offline" in out or "device not found" in out \
+            or "device .* offline" in out or "'adb devices'" in out:
+        return tr("الجهاز غير متصل — تأكد من الاتصال",
+                  "device is offline — check the connection")
+    if "timeout" in out or "timed out" in out:
+        return tr("انتهت المهلة — الاتصال بطيء",
+                  "timed out — connection too slow")
+    line = next((ln.strip() for ln in (output or "").splitlines()
+                 if ln.strip() and "performing streamed install"
+                 not in ln.lower()), "")
+    return line or tr("خطأ غير معروف", "unknown error")
+
+
+class InstallProgressDialog(QDialog):
+    """Live progress window for APK installs: per-file bar + real cancel."""
+
+    step_changed = pyqtSignal(str, int)
+    close_requested = pyqtSignal()
+    show_requested = pyqtSignal()
+
+    def __init__(self, total, title):
+        super().__init__()
+        self.setWindowTitle(title)
+        self.setModal(False)
+        self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
+        lay = QVBoxLayout(self)
+        self.file_label = QLabel("…")
+        lay.addWidget(self.file_label)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, max(1, total))
+        self.bar.setValue(0)
+        lay.addWidget(self.bar)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.cancel_btn = QPushButton(tr("إلغاء", "Cancel"))
+        self.cancel_btn.clicked.connect(self.request_cancel)
+        row.addWidget(self.cancel_btn)
+        lay.addLayout(row)
+        self.resize(380, 90)
+        self.step_changed.connect(self._on_step)
+        self.close_requested.connect(self._on_finish)
+        self.show_requested.connect(self.show)
+        self._cancel_requested = False
+
+    def _on_step(self, name, index):
+        self.file_label.setText(f"[{index}/{self.total()}] {name}")
+        self.bar.setValue(index)
+
+    def _on_finish(self):
+        # runs on the GUI thread (queued from the worker via the signal);
+        # bar stays honest — no fake jump to 100% on cancel
+        self.cancel_btn.setEnabled(False)
+        self.close()
+
+    def total(self):
+        return self.bar.maximum()
+
+    def cancel_requested(self):
+        # plain bool read: safe across threads
+        return self._cancel_requested
+
+    def request_cancel(self):
+        self._cancel_requested = True
+        self.cancel_btn.setEnabled(False)
+        self.file_label.setText(
+            tr("جارٍ إلغاء العملية الحالية…", "Cancelling current file…"))
+
+    def finish(self):
+        # thread-safe: emitting a signal queues onto the GUI event loop
+        self.close_requested.emit()
+
+
 INFO_CMD = ("getprop ro.product.model; "
             "getprop ro.build.version.release; "
             "getprop ro.serialno; "
@@ -1135,6 +1235,7 @@ class DropZone(QWidget):
         lbl.setStyleSheet(
             "background:#17202a;color:#ecf0f1;border:3px dashed #3498db;"
             "border-radius:16px;font-size:15px;font-weight:bold;")
+        self.lbl = lbl
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(lbl)
@@ -1172,13 +1273,31 @@ class DropZone(QWidget):
 
     def dragEnterEvent(self, e):
         if any(is_apk(u.toLocalFile()) for u in e.mimeData().urls()):
+            self.lbl.setStyleSheet(
+                "background:#1a5276;color:#ffffff;border:3px solid #2ecc71;"
+                "border-radius:16px;font-size:15px;font-weight:bold;")
             e.acceptProposedAction()
 
+    def dragLeaveEvent(self, e):
+        self.lbl.setStyleSheet(
+            "background:#17202a;color:#ecf0f1;border:3px dashed #3498db;"
+            "border-radius:16px;font-size:15px;font-weight:bold;")
+
     def dropEvent(self, e):
-        paths = [u.toLocalFile() for u in e.mimeData().urls()
-                 if is_apk(u.toLocalFile())]
-        if paths and self.tray is not None:
-            self.tray.install_flow(paths)
+        self.dragLeaveEvent(e)
+        paths = [u.toLocalFile() for u in e.mimeData().urls()]
+        apks = [p for p in paths if is_apk(p)]
+        skipped = len(paths) - len(apks)
+        if not apks:
+            notify(tr("ملفات غير مدعومة", "Unsupported files"),
+                   tr("أفلت ملفات APK فقط", "Drop APK files only"))
+            return
+        if skipped and self.tray is not None:
+            notify(tr("ملفات متجاهَلة", "Files skipped"),
+                   tr(f"{skipped} ليست APK وسيُتجاهل",
+                      f"{skipped} non-APK file(s) will be ignored"))
+        if apks and self.tray is not None:
+            self.tray.install_flow(apks)
 
 
 class Tray(QSystemTrayIcon):
@@ -1284,6 +1403,17 @@ class Tray(QSystemTrayIcon):
             self._dropzone.close_me()
 
     def install_flow(self, paths):
+        rejected = []
+        if paths:
+            apk_paths = [p for p in paths if is_apk(p)]
+            rejected = [os.path.basename(p) for p in paths
+                        if not is_apk(p)]
+            paths = apk_paths
+            if not paths:
+                notify(tr("ملفات غير مدعومة", "Unsupported files"),
+                       tr(f"تجاهُلت {len(rejected)} — المطلوب ملفات APK",
+                          f"skipped {len(rejected)} — APK files only"))
+                return
         if not paths:
             paths, _ = QFileDialog.getOpenFileNames(
                 None, tr("اختر ملفات APK", "Choose APK files"),
@@ -1296,34 +1426,113 @@ class Tray(QSystemTrayIcon):
                    tr("وصّل جهازًا أولًا", "Connect a device first"))
             return
         if len(online) == 1:
-            self._do_install(paths, online[0])
+            self._do_install(paths, online[0], rejected)
             return
         menu = QMenu()
         for d in online:
             menu.addAction(
                 f"📱 {resolve_label(d['serial'], d['model'], S.get('aliases'))}"
-            ).triggered.connect(lambda _, dd=d: self._do_install(paths, dd))
+            ).triggered.connect(
+                lambda _, dd=d: self._do_install(paths, dd, rejected))
         menu.exec_(QCursor.pos())
 
-    def _do_install(self, paths, dev):
+    # per-file adb timeout; the outer run_job gate must outlive it so a
+    # slow multi-APK batch never trips the watchdog mid-install
+    INSTALL_FILE_TIMEOUT = 300
+
+    def _do_install(self, paths, dev, rejected=None):
+        title = tr("تثبيت APK", "APK install")
+        dlg = InstallProgressDialog(len(paths), title)
+        cancelled_reason = tr("أُلغي", "cancelled")
+        queued = [False]
+
+        # preflight: if the gate will queue us (another op is running),
+        # don't flash an orphan dialog — run_job notifies instead
+        if self.busy and self._busy_owner is not None \
+                and time.time() < self._busy_deadline:
+            queued[0] = True
+        else:
+            dlg.show()  # GUI thread here (menu/drop callbacks)
+
+        def run_one(path):
+            """Install one APK; returns (ok, reason). Cancellable live."""
+            tmpo = tempfile.TemporaryFile(mode="w+", encoding="utf-8",
+                                          errors="replace")
+            try:
+                proc = subprocess.Popen(
+                    ["adb", "-s", dev["serial"], "install", "-r", path],
+                    stdout=tmpo, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL)
+            except Exception as e:  # adb missing etc.
+                return False, str(e)
+            deadline = time.time() + self.INSTALL_FILE_TIMEOUT
+            timed_out = False
+            try:
+                while proc.poll() is None:
+                    if dlg.cancel_requested():
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            proc.kill()
+                            proc.wait()
+                        return False, cancelled_reason
+                    if time.time() > deadline:
+                        timed_out = True
+                        proc.kill()
+                        proc.wait()
+                        break
+                    time.sleep(0.25)
+            finally:
+                tmpo.seek(0)
+                out = tmpo.read()
+                tmpo.close()
+            if timed_out:
+                return False, tr("انتهت المهلة — الاتصال بطيء أو مقطوع",
+                                 "timed out — connection slow or broken")
+            reason = friendly_adb_error(out)
+            return (not reason), reason
+
         def job():
-            results = []
-            for p in paths:
-                r = subprocess.run(
-                    ["adb", "-s", dev["serial"], "install", "-r", p],
-                    capture_output=True, text=True, timeout=180)
-                okflag = "Success" in (r.stdout or "")
-                results.append((os.path.basename(p), okflag))
-            okl = [n for n, k in results if k]
-            badl = [n for n, k in results if not k]
-            msg = ""
-            if okl:
-                msg += tr("ثُبّت: ", "Installed: ") + "، ".join(okl)
-            if badl:
-                msg += ("\n" if msg else "") + \
-                    tr("فشل: ", "Failed: ") + "، ".join(badl)
-            self.op_done.emit(tr("تثبيت APK", "APK install"), msg)
-        self.run_job(job, blocking=True, timeout=180,
+            try:
+                if queued[0]:
+                    # worker thread — must reach show() via a queued signal
+                    dlg.show_requested.emit()
+                results = []  # (name, ok, reason)
+                for i, p in enumerate(paths, 1):
+                    if dlg.cancel_requested():
+                        break
+                    name = os.path.basename(p)
+                    dlg.step_changed.emit(name, i)
+                    ok, why = run_one(p)
+                    results.append((name, ok, why))
+                cancelled = len(results) < len(paths)
+                okl = [n for n, k, _ in results if k]
+                badl = [(n, why) for n, k, why in results if not k]
+                msg = ""
+                if okl:
+                    msg += tr("ثُبّت: ", "Installed: ") + "، ".join(okl)
+                for n, why in badl:
+                    if why == cancelled_reason:
+                        continue
+                    msg += ("\n" if msg else "") + \
+                        tr(f"فشل {n}: ", f"Failed {n}: ") + why
+                if cancelled:
+                    msg += ("\n" if msg else "") + \
+                        tr("أُلغي باقي القائمة بناءً على طلبك",
+                           "rest of the list cancelled as requested")
+                if rejected:
+                    msg += ("\n" if msg else "") + \
+                        tr(f"تم تجاهل {len(rejected)} ملف غير APK: ",
+                           f"skipped {len(rejected)} non-APK file(s): ") + \
+                        "، ".join(rejected)
+                self.op_done.emit(title, msg)
+            finally:
+                # never leave an orphan dialog behind on any code path
+                dlg.finish()
+
+        self.run_job(job, blocking=True,
+                     timeout=len(paths) * self.INSTALL_FILE_TIMEOUT + 60,
                      hint=tr("جارٍ التثبيت...", "Installing..."))
 
     def screenshot(self, target, model):
@@ -1874,8 +2083,16 @@ def QTimer_single(ms, fn):
     QTimer.singleShot(ms, fn)
 
 
-TRAY_WAIT_TRIES = 40          # 40 * 1.5 s = 60 s max wait
-TRAY_WAIT_INTERVAL_MS = 1500
+TRAY_WAIT_INTERVAL_MS = 2000
+TRAY_WARN_AFTER_TRIES = 30    # ~60 s before telling the user (keep trying)
+
+
+def log(msg):
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} [tray] {msg}\n")
+    except OSError:
+        pass
 
 
 def main():
@@ -1889,9 +2106,11 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("adb-wireless-manager")
 
-    state = {"tray": None, "tries": 0}
+    log(f"starting v{__version__} (pid={os.getpid()})")
+    state = {"tray": None, "tries": 0, "warned": False}
 
     def start_tray():
+        log(f"system tray ready after {state['tries']} wait cycle(s) — starting")
         tray = Tray()
         tray.show()
         state["tray"] = tray
@@ -1905,23 +2124,25 @@ def main():
     def wait_for_tray():
         if state["tray"] is not None:
             return
+        state["tries"] += 1
         if QSystemTrayIcon.isSystemTrayAvailable():
             start_tray()
-        elif state["tries"] < TRAY_WAIT_TRIES:
-            state["tries"] += 1
-            QTimer_single(TRAY_WAIT_INTERVAL_MS, wait_for_tray)
-        else:
+            return
+        if not state["warned"] and state["tries"] >= TRAY_WARN_AFTER_TRIES:
+            state["warned"] = True
+            log("tray still unavailable — notifying user, keep polling")
             notify("ADB Wireless Manager",
-                   tr("شريط النظام غير متاح في هذه الجلسة.",
-                      "System tray is not available on this desktop "
-                      "session."))
-            app.quit()
+                   tr("شريط النظام غير متاح بعد — سأواصل المحاولة.",
+                      "System tray is not available yet — still trying."))
+        QTimer_single(TRAY_WAIT_INTERVAL_MS, wait_for_tray)
 
     # At login the desktop shell may not have published its tray yet
     # (AppIndicator / StatusNotifier DBus service) — poll instead of dying.
     if QSystemTrayIcon.isSystemTrayAvailable():
         start_tray()
     else:
+        log("tray not ready at startup — polling every "
+            f"{TRAY_WAIT_INTERVAL_MS // 1000} s")
         QTimer_single(TRAY_WAIT_INTERVAL_MS, wait_for_tray)
     return app.exec_()
 
