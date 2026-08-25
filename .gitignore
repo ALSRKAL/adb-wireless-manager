@@ -11,3 +11,4 @@ Thumbs.db
 devices.tsv
 .idea/
 .vscode/
+.fuse_hidden*
