@@ -105,6 +105,7 @@ Terminal=false
 Categories=Utility;Network;
 Icon=phone
 X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5
 EOF
     ok "Tray autostart -> $XDG_AUTOSTART/adbtray.desktop"
 fi

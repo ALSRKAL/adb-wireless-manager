@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QMenu, QMessageBox, QPushButton, QSpinBox,
                              QSystemTrayIcon, QVBoxLayout, QWidget)
 
-__version__ = "13.0.10"
+__version__ = "13.0.11"
 REPO = "ALSRKAL/adb-wireless-manager"
 REPO_URL = f"https://github.com/{REPO}"
 
@@ -1874,6 +1874,10 @@ def QTimer_single(ms, fn):
     QTimer.singleShot(ms, fn)
 
 
+TRAY_WAIT_TRIES = 40          # 40 * 1.5 s = 60 s max wait
+TRAY_WAIT_INTERVAL_MS = 1500
+
+
 def main():
     lock_sock = acquire_single_instance_lock()
     if lock_sock is None:
@@ -1885,20 +1889,40 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("adb-wireless-manager")
 
-    if not QSystemTrayIcon.isSystemTrayAvailable():
-        notify("ADB Wireless Manager",
-               tr("شريط النظام غير متاح في هذه الجلسة.",
-                  "System tray is not available on this desktop session."))
-        return 1
+    state = {"tray": None, "tries": 0}
 
-    tray = Tray()
-    tray.show()
-    threading.Thread(target=tray.update_check_loop, daemon=True).start()
-    if S.get("show_dropzone"):
-        QTimer_single(500, tray.ensure_dropzone)
-    notify("ADB Wireless Manager v" + __version__,
-           tr("يعمل الآن — انقر الأيقونة للقائمة",
-              "Running — click the icon for the menu"))
+    def start_tray():
+        tray = Tray()
+        tray.show()
+        state["tray"] = tray
+        threading.Thread(target=tray.update_check_loop, daemon=True).start()
+        if S.get("show_dropzone"):
+            QTimer_single(500, tray.ensure_dropzone)
+        notify("ADB Wireless Manager v" + __version__,
+               tr("يعمل الآن — انقر الأيقونة للقائمة",
+                  "Running — click the icon for the menu"))
+
+    def wait_for_tray():
+        if state["tray"] is not None:
+            return
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            start_tray()
+        elif state["tries"] < TRAY_WAIT_TRIES:
+            state["tries"] += 1
+            QTimer_single(TRAY_WAIT_INTERVAL_MS, wait_for_tray)
+        else:
+            notify("ADB Wireless Manager",
+                   tr("شريط النظام غير متاح في هذه الجلسة.",
+                      "System tray is not available on this desktop "
+                      "session."))
+            app.quit()
+
+    # At login the desktop shell may not have published its tray yet
+    # (AppIndicator / StatusNotifier DBus service) — poll instead of dying.
+    if QSystemTrayIcon.isSystemTrayAvailable():
+        start_tray()
+    else:
+        QTimer_single(TRAY_WAIT_INTERVAL_MS, wait_for_tray)
     return app.exec_()
 
 
