@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  Auto ADB WiFi Connector  v11.0
-#  Wireless ADB manager: connect / reconnect / pair / watch / doctor
-#  Supports classic tcpip (Android <11) and Wireless Debugging mDNS (Android 11+)
-#  Requires: bash 4+, adb.  Optional: scrcpy, ss|netstat, ping, jq
+#  ADB Wireless Manager - POSIX CLI
+#  Commands: connect / reconnect / pair / watch / list / disconnect / doctor
+#  Prefers Android 11+ wireless debugging over mDNS and falls back to classic
+#  tcpip only when that is unavailable, because tcpip restarts adbd and
+#  switches the phone's Wireless-debugging toggle off.
+#  Requires: bash 4+, adb.  Optional: scrcpy, ss|netstat, ping
 #  Repo    : https://github.com/ALSRKAL/adb-wireless-manager
 # ==============================================================================
 set -uo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="13.0.13"
+readonly VERSION="14.0.0"
 readonly SCRIPT_NAME="${0##*/}"
 
 # ------------------------------------------------------------------------------
-# 1) CENTRAL CONFIG  (single source of truth — override via config file or env)
+# 1) CENTRAL CONFIG  (single source of truth - override via config file or env)
 #    Config file: ~/.config/adbconnect/config   (plain KEY=VALUE bash)
 # ------------------------------------------------------------------------------
 readonly XDG_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/adbconnect"
@@ -27,12 +29,15 @@ readonly CACHE_FILE="$XDG_DATA/devices.tsv"
 readonly SUSPENDED_FILE="$XDG_DATA/suspended.tsv"
 _LOCK_FILE="/tmp/adbconnect.$(id -u).lock"
 readonly LOCK_FILE="$_LOCK_FILE"
+readonly LOCK_WAIT=45        # seconds a manual command waits for a watch pass
 
 START_PORT="${ADBC_START_PORT:-5555}"          # first port to try
 MAX_RETRIES="${ADBC_MAX_RETRIES:-3}"           # connect attempts per IP
 CONNECT_TIMEOUT="${ADBC_CONNECT_TIMEOUT:-6}"   # seconds per adb connect
 SHELL_TIMEOUT="${ADBC_SHELL_TIMEOUT:-4}"       # seconds per adb shell probe
 TCPIP_SETTLE="${ADBC_TCPIP_SETTLE:-3}"         # sleep after `adb tcpip`
+MDNS_WAIT="${ADBC_MDNS_WAIT:-20}"              # seconds to await an mDNS advert
+WIRELESS_SDK=30                                # Android 11: adb_wifi_enabled
 AUTO_SCRCPY="${ADBC_AUTO_SCRCPY:-true}"        # launch scrcpy on success
 SCRCPY_ARGS="${ADBC_SCRCPY_ARGS:-}"            # extra scrcpy flags
 WATCH_INTERVAL="${ADBC_WATCH_INTERVAL:-20}"    # --watch poll seconds
@@ -96,70 +101,86 @@ fi
 declare -A T_AR=(
   [banner]="مدير ADB اللاسلكي"
   [need]="أداة مطلوبة غير مثبتة: %s"
-  [locked]="نسخة أخرى تعمل بالخلفية. لتوصيل جهاز جديد نفّذ: systemctl --user stop adbconnect-watch ثم أعد المحاولة."
+  [locked]="عملية أخرى ما زالت تعمل بعد انتظار %s ثانية. أوقف خدمة المراقبة ثم أعد المحاولة: systemctl --user stop adbwatch.service"
   [no_usb]="لا توجد أجهزة USB متصلة (أو أن التخويل مرفوض)."
   [dev]="الجهاز: %s %s"
-  [unauth]="غير مصرَّح (unauthorized) — اقبل نافذة التخويل على شاشة الهاتف."
+  [unauth]="غير مصرَّح (unauthorized) - اقبل نافذة التخويل على شاشة الهاتف."
   [offline_usb]="حالة الجهاز غير جاهزة: %s"
   [port]="المنفذ المخصص: %s"
   [tcpip]="تفعيل وضع TCP/IP..."
   [tcpip_fail]="فشل أمر tcpip: %s"
   [no_ip]="لا يوجد عنوان IP على شبكة WiFi. تحقق من اتصال الهاتف."
-  [try]="محاولة %s/%s ← %s"
-  [unreachable]="العنوان %s لا يستجيب للشبكة (ping) — تأكد أن الجهازين على نفس الشبكة."
+  [try]="محاولة %s/%s > %s"
+  [unreachable]="العنوان %s لا يستجيب للشبكة (ping) - تأكد أن الجهازين على نفس الشبكة."
   [ok]="تم الاتصال والتحقق: %s"
-  [zombie]="اتصال وهمي (لا يستجيب للأوامر) — إصلاح عميق..."
-  [dev_offline]="الجهاز offline — إصلاح عميق..."
-  [reset]="إعادة تهيئة الاتصال (Hard Reset)..."
+  [zombie]="الاتصال قائم لكن الجهاز لا يستجيب للأوامر - إصلاح..."
+  [dev_offline]="الاتصال معلّق في حالة offline - إصلاح..."
+  [reset]="تنظيف الاتصال من جهة الحاسب..."
+  [wrong_dev]="العنوان %s يخص جهازًا آخر (%s) - تم إلغاء الاتصال."
+  [refused]="لا شيء يستمع على %s - التصحيح اللاسلكي مغلق أو المنفذ تغيّر."
+  [no_answer]="لا استجابة من %s خلال المهلة - العنوان غير قابل للوصول."
+  [wireless_on]="تفعيل التصحيح اللاسلكي على الجهاز..."
+  [await_mdns]="بانتظار إعلان التصحيح اللاسلكي عبر mDNS..."
+  [via_mdns]="اتصال عبر التصحيح اللاسلكي: %s"
+  [legacy]="لا يوجد تصحيح لاسلكي متاح - استخدام tcpip (سيُعاد تشغيل adbd على الهاتف)."
+  [wifi_restored]="تم إرجاع مفتاح التصحيح اللاسلكي إلى وضع التشغيل."
   [failed_dev]="فشلت كل المحاولات لهذا الجهاز. راجع السجل: %s"
-  [unplug]="يمكنك سحب كابل USB الآن — الاتصال اللاسلكي شغّال."
+  [unplug]="يمكنك سحب كابل USB الآن - الاتصال اللاسلكي شغّال."
   [scrcpy_run]="Scrcpy يعمل بالفعل لهذا الجهاز."
   [scrcpy_go]="تشغيل Scrcpy..."
   [summary]="الخلاصة"
   [none_conn]="لا توجد اتصالات لاسلكية حالياً."
   [cache_empty]="لا توجد أجهزة محفوظة. وصّل الجهاز بـ USB ونفّذ السكربت مرة واحدة."
   [recon]="إعادة اتصال بالمحفوظ: %s (%s)"
-  [mdns]="جهاز مقترن ظهر عبر mDNS: %s — جارٍ الاتصال..."
+  [mdns]="جهاز مقترن ظهر عبر mDNS: %s - جارٍ الاتصال..."
   [already]="متصل مسبقاً: %s"
   [disc]="تم فصل: %s"
   [pair_scan]="جارٍ البحث عن أجهزة الاقتران (mDNS)..."
-  [pair_none]="لم يتم العثور على جهاز في وضع الاقتران. الهاتف: إعدادات المطوّر ← تصحيح لاسلكي ← الإقران برمز."
+  [pair_none]="لم يتم العثور على جهاز في وضع الاقتران. الهاتف: إعدادات المطوّر > تصحيح لاسلكي > الإقران برمز."
   [pair_found]="تم العثور على: %s"
   [pair_ask]="أدخل رمز الاقتران المكوّن من 6 أرقام: "
   [pair_ok]="تم الاقتران بنجاح مع %s"
   [pair_fail]="فشل الاقتران. تأكد من الرمز وأن نافذة الاقتران ما زالت مفتوحة."
   [watch]="مراقبة مستمرة كل %s ثانية (Ctrl+C للإيقاف)..."
-  [watch_lost]="انقطع %s — إعادة اتصال..."
+  [watch_lost]="انقطع %s - إعادة اتصال..."
   [doctor]="تشخيص البيئة"
   [bye]="تم."
 )
 declare -A T_EN=(
   [banner]="Wireless ADB Manager"
   [need]="Missing required tool: %s"
-  [locked]="Another instance is running (auto-watch). For a new device: systemctl --user stop adbconnect-watch, then retry."
+  [locked]="Another operation is still running after waiting %ss. Stop the watch service and retry: systemctl --user stop adbwatch.service"
   [no_usb]="No USB devices detected (or authorization denied)."
   [dev]="Device: %s %s"
-  [unauth]="Unauthorized — accept the RSA prompt on the phone screen."
+  [unauth]="Unauthorized - accept the RSA prompt on the phone screen."
   [offline_usb]="Device state not ready: %s"
   [port]="Assigned port: %s"
   [tcpip]="Enabling TCP/IP mode..."
   [tcpip_fail]="tcpip command failed: %s"
   [no_ip]="No WiFi IP address found. Check the phone's connection."
   [try]="Attempt %s/%s -> %s"
-  [unreachable]="%s is not reachable (ping) — make sure both are on the same LAN."
+  [unreachable]="%s is not reachable (ping) - make sure both are on the same LAN."
   [ok]="Connected and verified: %s"
-  [zombie]="Zombie connection (not responding) — hard reset..."
-  [dev_offline]="Device offline — hard reset..."
-  [reset]="Re-initializing connection (hard reset)..."
+  [zombie]="Linked but the device answers no commands - healing..."
+  [dev_offline]="Transport stuck offline - healing..."
+  [reset]="Clearing the transport on the host side..."
+  [wrong_dev]="%s belongs to a different device (%s) - connection dropped."
+  [refused]="Nothing is listening on %s - wireless debugging is off or the port changed."
+  [no_answer]="No answer from %s within the timeout - the address is unreachable."
+  [wireless_on]="Turning wireless debugging on over the cable..."
+  [await_mdns]="Waiting for the wireless-debugging mDNS advert..."
+  [via_mdns]="Connected through wireless debugging: %s"
+  [legacy]="No wireless debugging available - falling back to tcpip (this restarts adbd on the phone)."
+  [wifi_restored]="Wireless debugging toggle switched back on."
   [failed_dev]="All attempts failed for this device. See log: %s"
-  [unplug]="You can unplug the USB cable now — the wireless link is live."
+  [unplug]="You can unplug the USB cable now - the wireless link is live."
   [scrcpy_run]="Scrcpy already running for this device."
   [scrcpy_go]="Launching scrcpy..."
   [summary]="Summary"
   [none_conn]="No wireless connections right now."
   [cache_empty]="No saved devices. Plug in USB and run once."
   [recon]="Reconnecting saved device: %s (%s)"
-  [mdns]="Paired device discovered via mDNS: %s — connecting..."
+  [mdns]="Paired device discovered via mDNS: %s - connecting..."
   [already]="Already connected: %s"
   [disc]="Disconnected: %s"
   [pair_scan]="Scanning for pairing devices (mDNS)..."
@@ -169,7 +190,7 @@ declare -A T_EN=(
   [pair_ok]="Paired successfully with %s"
   [pair_fail]="Pairing failed. Check the code and keep the pairing dialog open."
   [watch]="Watching every %ss (Ctrl+C to stop)..."
-  [watch_lost]="%s dropped — reconnecting..."
+  [watch_lost]="%s dropped - reconnecting..."
   [doctor]="Environment diagnostics"
   [bye]="Done."
 )
@@ -196,13 +217,13 @@ init_log() {
 
 log() { # log <INFO|OK|WARN|ERR|DEBUG> <message>
     local lvl="$1"; shift
-    local msg="$*" color="$NC" icon=" "
+    local msg="$*" color="$NC" icon="[    ]"
     case "$lvl" in
-        INFO)  color="$BLUE";   icon="•" ;;
-        OK)    color="$GREEN";  icon="✔" ;;
-        WARN)  color="$YELLOW"; icon="!" ;;
-        ERR)   color="$RED";    icon="✘" ;;
-        DEBUG) color="$DIM";    icon="·" ;;
+        INFO)  color="$BLUE";   icon="[INFO]" ;;
+        OK)    color="$GREEN";  icon="[ OK ]" ;;
+        WARN)  color="$YELLOW"; icon="[WARN]" ;;
+        ERR)   color="$RED";    icon="[FAIL]" ;;
+        DEBUG) color="$DIM";    icon="[ .. ]" ;;
     esac
     printf '[%s] [%-5s] %s\n' "$(date '+%H:%M:%S')" "$lvl" "$msg" >>"$LOG_FILE"
     [[ "$lvl" == "DEBUG" && "$VERBOSE" != true ]] && return 0
@@ -217,12 +238,17 @@ die() { log ERR "$*"; exit 1; }
 # ------------------------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Every adb invocation closes fd 9, the lock descriptor. An adb server that
+# gets daemonized while fd 9 is inherited would hold the lock for as long as it
+# lives and block every later command with "another operation is running".
 run_to() { # run_to <seconds> <cmd...>  (portable timeout)
     local s="$1"; shift
-    if   have timeout;  then timeout --foreground "$s" "$@"
-    elif have gtimeout; then gtimeout --foreground "$s" "$@"
-    else "$@"; fi
+    if   have timeout;  then timeout --foreground "$s" "$@" 9>&-
+    elif have gtimeout; then gtimeout --foreground "$s" "$@" 9>&-
+    else "$@" 9>&-; fi
 }
+
+adbc() { command adb "$@" 9>&-; }
 
 adbq() { run_to "$SHELL_TIMEOUT" adb "$@" 2>>"$LOG_FILE"; }
 
@@ -259,23 +285,56 @@ mdns_entries() { # "serial<TAB>ip:port" for each discovered paired device
 # 5) DEVICE LAYER
 # ------------------------------------------------------------------------------
 usb_serials() {
-    adb devices 2>>"$LOG_FILE" | awk 'NR>1 && NF>=2 && $1 !~ /:|_adb-tls-/ {print $1"\t"$2}'
+    adbc devices 2>>"$LOG_FILE" | awk 'NR>1 && NF>=2 && $1 !~ /:|_adb-tls-/ {print $1"\t"$2}'
 }
 
 device_label() { # model / product for nicer output
     local s="$1" label
-    label=$(adb devices -l 2>>"$LOG_FILE" | awk -v s="$s" '$1==s{for(i=1;i<=NF;i++) if($i ~ /^model:/){sub("model:","",$i); print $i; exit}}')
+    label=$(adbc devices -l 2>>"$LOG_FILE" | awk -v s="$s" '$1==s{for(i=1;i<=NF;i++) if($i ~ /^model:/){sub("model:","",$i); print $i; exit}}')
     printf '%s' "${label:-unknown}"
 }
 
 state_of() { # exact adb state string for a serial/target
-    adb devices 2>>"$LOG_FILE" | awk -v s="$1" '$1==s{print $2; exit}'
+    adbc devices 2>>"$LOG_FILE" | awk -v s="$1" '$1==s{print $2; exit}'
 }
 
 is_ready() { [[ "$(state_of "$1")" == "device" ]]; }
 
 alive() { # real command round-trip, not just list presence
     [[ "$(adbq -s "$1" shell echo ok 2>/dev/null | tr -d '\r\n')" == "ok" ]]
+}
+
+device_sdk() { # target -> API level, empty when unknown
+    adbq -s "$1" shell getprop ro.build.version.sdk 2>/dev/null \
+        | tr -dc '0-9'
+}
+
+wireless_debugging_on() { # target -> 0 when the Android 11+ toggle is on
+    [[ "$(adbq -s "$1" shell settings get global adb_wifi_enabled \
+        2>/dev/null | tr -d '\r\n')" == "1" ]]
+}
+
+enable_wireless_debugging() { # target
+    # The adb shell user holds WRITE_SECURE_SETTINGS, so this both enables
+    # the toggle and restores one that an earlier adbd restart switched off.
+    adbq -s "$1" shell settings put global adb_wifi_enabled 1 >/dev/null 2>&1
+}
+
+mdns_target_for_serial() { # serial -> ip:port advertised for that serial
+    local want
+    want=$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]')
+    [[ -z "$want" ]] && return 0
+    mdns_entries | awk -F'\t' -v s="$want" '$1==s {print $2; exit}'
+}
+
+wait_for_mdns_target() { # serial [seconds] -> ip:port once advertised
+    local serial="$1" limit="${2:-$MDNS_WAIT}" waited=0 hit
+    while (( waited < limit )); do
+        hit=$(mdns_target_for_serial "$serial")
+        [[ -n "$hit" ]] && { printf '%s' "$hit"; return 0; }
+        sleep 2; waited=$(( waited + 2 ))
+    done
+    return 1
 }
 
 device_ips() { # ordered: preferred interfaces first
@@ -303,10 +362,15 @@ device_ips() { # ordered: preferred interfaces first
 # 6) CACHE (remember devices -> reconnect later without a cable)
 # ------------------------------------------------------------------------------
 cache_put() { # serial ip port label
+    # One row per device. Matching is case-insensitive on the serial and also
+    # drops any row holding the same address, so a phone whose wireless port
+    # rotated replaces its old row instead of adding a duplicate.
     local serial="$1" ip="$2" port="$3" label="$4" tmp
+    serial=$(printf '%s' "$serial" | tr '[:lower:]' '[:upper:]')
     mkdir -p "$XDG_DATA"; touch "$CACHE_FILE"
     tmp=$(mktemp) || return 0
-    awk -F'\t' -v s="$serial" '$1!=s' "$CACHE_FILE" >"$tmp" 2>/dev/null
+    awk -F'\t' -v s="$serial" -v h="$ip" '
+        toupper($1) != s && $2 != h' "$CACHE_FILE" >"$tmp" 2>/dev/null
     printf '%s\t%s\t%s\t%s\t%s\n' "$serial" "$ip" "$port" "$label" "$(date +%s)" >>"$tmp"
     mv -f "$tmp" "$CACHE_FILE"
 }
@@ -322,8 +386,11 @@ suspended_serials() {
     return 0
 }
 
-is_suspended() {
-    suspended_serials | grep -qxFe "$1"
+is_suspended() { # case-insensitive: cache and adb disagree on serial casing
+    local want
+    want=$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]')
+    [[ -z "$want" ]] && return 1
+    suspended_serials | tr '[:lower:]' '[:upper:]' | grep -qxFe "$want"
 }
 
 suspend_add() { # serial
@@ -347,43 +414,84 @@ suspend_del() { # serial
 # ------------------------------------------------------------------------------
 # 7) CONNECTION LOGIC
 # ------------------------------------------------------------------------------
-hard_reset() { # serial ip port
-    local serial="$1" ip="$2" port="$3"
+heal_transport() { # ip port
+    # Clears a half-open transport on the HOST only. `adb usb` / `adb tcpip`
+    # restart adbd on the phone, which on Android 11+ tears down the
+    # Wireless-debugging session and leaves the toggle switched off, so
+    # neither belongs in a healing path.
+    local ip="$1" port="$2"
     log WARN "$(t reset)"
-    adb disconnect "$ip:$port" >>"$LOG_FILE" 2>&1
-    if [[ -n "$serial" ]] && is_ready "$serial"; then
-        adbq -s "$serial" usb >/dev/null 2>&1; sleep 2
-        adbq -s "$serial" tcpip "$port" >/dev/null 2>&1; sleep "$TCPIP_SETTLE"
-    fi
+    adbc disconnect "$ip:$port" >>"$LOG_FILE" 2>&1
+    run_to 8 adb reconnect offline >>"$LOG_FILE" 2>&1
 }
 
-connect_target() { # serial ip port  -> 0 on verified success
-    local serial="$1" ip="$2" port="$3" attempt out
+is_hard_connect_failure() { # adb connect output -> 0 when retrying is pointless
+    local out
+    out=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+    [[ "$out" == *refused* || "$out" == *"no route to host"* \
+       || "$out" == *"network is unreachable"* \
+       || "$out" == *"host is unreachable"* \
+       || "$out" == *"unknown host"* ]]
+}
+
+serial_of_target() { # target -> hardware serial (uppercase) or empty
+    adbq -s "$1" shell getprop ro.serialno 2>/dev/null \
+        | tr -d '\r\n' | tr '[:lower:]' '[:upper:]'
+}
+
+connect_target() { # expected_serial ip port -> 0 on verified success
+    local want ip="$2" port="$3" attempt out got tries="$MAX_RETRIES"
+    want=$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]')
     local target="$ip:$port"
     if ! reachable_host "$ip"; then
+        # ICMP may simply be filtered, so this is not fatal - but spending the
+        # full retry budget on a host that does not answer at all is what makes
+        # a healing pass drag on for a minute.
         log WARN "$(t unreachable "$ip")"
+        tries=1
     fi
-    for ((attempt = 1; attempt <= MAX_RETRIES; attempt++)); do
-        log INFO "$(t try "$attempt" "$MAX_RETRIES" "$target")"
+    for ((attempt = 1; attempt <= tries; attempt++)); do
+        log INFO "$(t try "$attempt" "$tries" "$target")"
         out=$(run_to "$CONNECT_TIMEOUT" adb connect "$target" 2>&1)
         log DEBUG "adb connect: ${out//$'\n'/ }"
         sleep 1
         case "$(state_of "$target")" in
             device)
                 if alive "$target"; then
+                    got=$(serial_of_target "$target")
+                    # identity check: refuse a phone that merely inherited
+                    # this address from the one we were looking for
+                    if [[ -n "$want" && -n "$got" && "$want" != "$got" ]]; then
+                        adbc disconnect "$target" >/dev/null 2>&1
+                        log ERR "$(t wrong_dev "$target" "$got")"
+                        return 1
+                    fi
                     log OK "$(t ok "$target")"
                     return 0
                 fi
                 log WARN "$(t zombie)"
-                hard_reset "$serial" "$ip" "$port"
+                heal_transport "$ip" "$port"
                 ;;
             offline)
                 log WARN "$(t dev_offline)"
-                hard_reset "$serial" "$ip" "$port"
+                heal_transport "$ip" "$port"
                 ;;
             *)
-                adb disconnect "$target" >/dev/null 2>&1
-                sleep $(( attempt ))     # linear backoff
+                adbc disconnect "$target" >/dev/null 2>&1
+                # Retrying a refused or unroutable address cannot help: a
+                # stale mDNS advert or a wireless toggle that went off needs
+                # the NEXT candidate address, not another attempt at this one.
+                if is_hard_connect_failure "$out"; then
+                    log WARN "$(t refused "$target")"
+                    return 1
+                fi
+                if [[ -z "${out// }" ]]; then
+                    # killed by our own timeout before printing: that is what
+                    # an unroutable address looks like from here
+                    log WARN "$(t no_answer "$target")"
+                    return 1
+                fi
+                (( attempt < tries )) && sleep $(( attempt ))  # linear backoff
                 ;;
         esac
     done
@@ -406,8 +514,67 @@ launch_scrcpy() { # target label
 # ------------------------------------------------------------------------------
 # 8) ACTIONS
 # ------------------------------------------------------------------------------
+wireless_via_mdns() { # usb_serial ident label -> 0 when connected
+    # Preferred path on Android 11+: the phone already advertises a TLS
+    # wireless-debugging port, so we connect to it and never restart adbd.
+    local usb="$1" ident="$2" label="$3" target
+    target=$(mdns_target_for_serial "$ident")
+    if [[ -z "$target" ]]; then
+        if ! wireless_debugging_on "$usb"; then
+            log INFO "$(t wireless_on)"
+            enable_wireless_debugging "$usb"
+        fi
+        log INFO "$(t await_mdns)"
+        target=$(wait_for_mdns_target "$ident") || return 1
+    fi
+    if connect_target "$ident" "${target%:*}" "${target##*:}"; then
+        log OK "$(t via_mdns "$target")"
+        cache_put "$ident" "${target%:*}" "${target##*:}" "$label"
+        suspend_del "$ident"
+        launch_scrcpy "$target" "$label"
+        return 0
+    fi
+    return 1
+}
+
+wireless_via_tcpip() { # usb_serial ident label port -> 0 when connected
+    # Last resort. `adb tcpip` restarts adbd, which is what switches the
+    # Android 11+ wireless-debugging toggle off, so the toggle is restored
+    # afterwards if the user had it on.
+    local usb="$1" ident="$2" label="$3" port="$4" ips ip out
+    local wifi_was_on=false
+    wireless_debugging_on "$usb" && wifi_was_on=true
+    log WARN "$(t legacy)"
+    log INFO "$(t port "$port")"
+    log INFO "$(t tcpip)"
+    if ! out=$(run_to "$CONNECT_TIMEOUT" adb -s "$usb" tcpip "$port" 2>&1); then
+        log WARN "$(t tcpip_fail "${out//$'\n'/ }")"
+    fi
+    log DEBUG "tcpip: ${out//$'\n'/ }"
+    sleep "$TCPIP_SETTLE"
+
+    ips=$(device_ips "$usb")
+    if [[ -z "$ips" ]]; then
+        log ERR "$(t no_ip)"
+        $wifi_was_on && { enable_wireless_debugging "$usb"; log INFO "$(t wifi_restored)"; }
+        return 1
+    fi
+    while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        if connect_target "$ident" "$ip" "$port"; then
+            cache_put "$ident" "$ip" "$port" "$label"
+            suspend_del "$ident"
+            launch_scrcpy "$ip:$port" "$label"
+            $wifi_was_on && { enable_wireless_debugging "$usb"; log INFO "$(t wifi_restored)"; }
+            return 0
+        fi
+    done <<< "$ips"
+    $wifi_was_on && { enable_wireless_debugging "$usb"; log INFO "$(t wifi_restored)"; }
+    return 1
+}
+
 action_connect() { # main flow over USB devices
-    local rows serial state label port ips ip ok out total=0 done_n=0
+    local rows serial state label port ident sdk ok done_n=0
     rows=$(usb_serials)
     [[ -z "$rows" ]] && { log WARN "$(t no_usb)"; return 1; }
 
@@ -415,36 +582,24 @@ action_connect() { # main flow over USB devices
 
     while IFS=$'\t' read -r serial state; do
         [[ -z "$serial" ]] && continue
-        ((total++))
         label=$(device_label "$serial")
         printf '\n%s%s%s\n' "$BOLD" "$(t dev "$serial" "[$label]")" "$NC"
 
         if [[ "$state" == "unauthorized" ]]; then log ERR "$(t unauth)"; continue; fi
         if [[ "$state" != "device" ]]; then log ERR "$(t offline_usb "$state")"; continue; fi
 
-        port="$next_port"; next_port=$(next_free_port $((port + 1)))
-        log INFO "$(t port "$port")"
-
-        log INFO "$(t tcpip)"
-        if ! out=$(run_to "$CONNECT_TIMEOUT" adb -s "$serial" tcpip "$port" 2>&1); then
-            log WARN "$(t tcpip_fail "${out//$'\n'/ }")"
-        fi
-        log DEBUG "tcpip: ${out//$'\n'/ }"
-        sleep "$TCPIP_SETTLE"
-
-        ips=$(device_ips "$serial")
-        [[ -z "$ips" ]] && { log ERR "$(t no_ip)"; continue; }
+        ident=$(serial_of_target "$serial")
+        [[ -z "$ident" ]] && ident=$(printf '%s' "$serial" | tr '[:lower:]' '[:upper:]')
+        sdk=$(device_sdk "$serial")
 
         ok=false
-        while IFS= read -r ip; do
-            [[ -z "$ip" ]] && continue
-            if connect_target "$serial" "$ip" "$port"; then
-                ok=true
-                cache_put "$serial" "$ip" "$port" "$label"
-                launch_scrcpy "$ip:$port" "$label"
-                break
-            fi
-        done <<< "$ips"
+        if [[ -n "$sdk" ]] && (( sdk >= WIRELESS_SDK )); then
+            wireless_via_mdns "$serial" "$ident" "$label" && ok=true
+        fi
+        if [[ "$ok" != true ]]; then
+            port="$next_port"; next_port=$(next_free_port $((port + 1)))
+            wireless_via_tcpip "$serial" "$ident" "$label" "$port" && ok=true
+        fi
 
         if [[ "$ok" == true ]]; then
             ((done_n++))
@@ -457,71 +612,78 @@ action_connect() { # main flow over USB devices
     (( done_n > 0 )) && return 0 || return 1
 }
 
+known_devices() {
+    # One line per device: serial<TAB>target<TAB>label
+    # A fresh mDNS advert wins over the saved port, because Android rotates
+    # the wireless-debugging port on every reboot and Wi-Fi toggle. Merging
+    # on the serial here is what keeps the same phone from being visited
+    # twice in one pass.
+    { mdns_entries | awk -F'\t' '$1!="" {print $1"\t"$2"\tmDNS\t1"}'
+      cache_rows  | awk -F'\t' 'NF>=4 {print toupper($1)"\t"$2":"$3"\t"$4"\t2"}'
+    } | sort -t$'\t' -k1,1 -k4,4n \
+      | awk -F'\t' '{ key = ($1 != "" ? $1 : $2) }
+                    !seen[key]++ { print $1"\t"$2"\t"$3 }'
+}
+
+attach_known() { # serial target label -> 0 when connected and verified
+    local serial="$1" target="$2" label="$3" fresh
+    if [[ "$(state_of "$target")" == "device" ]] && alive "$target"; then
+        log OK "$(t already "$target [$label]")"
+        suspend_del "$serial"
+        return 0
+    fi
+    fresh=$(mdns_target_for_serial "$serial")
+    local cand
+    for cand in "$fresh" "$target"; do
+        [[ -z "$cand" ]] && continue
+        log INFO "$(t recon "$cand" "$label")"
+        if connect_target "$serial" "${cand%:*}" "${cand##*:}"; then
+            suspend_del "$serial"
+            cache_put "$serial" "${cand%:*}" "${cand##*:}" "$label"
+            launch_scrcpy "$cand" "$label"
+            return 0
+        fi
+        [[ "$fresh" == "$target" ]] && break
+    done
+    return 1
+}
+
 action_reconnect() { # explicit user action: overrides and clears suspensions
-    local rows serial ip port label ts ok=false target t mserial
-    rows=$(cache_rows)
-    [[ -z "$rows" ]] && log WARN "$(t cache_empty)"
-    while IFS=$'\t' read -r serial ip port label ts; do
-        [[ -z "${ip:-}" ]] && continue
-        target="$ip:$port"
-        if [[ "$(state_of "$target")" == "device" ]] && alive "$target"; then
-            log OK "$(t already "$target [$label]")"; ok=true
-            suspend_del "$serial"
-            continue
-        fi
-        log INFO "$(t recon "$target" "$label")"
-        if connect_target "" "$ip" "$port"; then
-            ok=true; launch_scrcpy "$target" "$label"
-            suspend_del "$serial"
-            cache_put "$serial" "$ip" "$port" "$label"
-        fi
+    local serial target label rows ok=false
+    rows=$(known_devices)
+    [[ -z "$rows" ]] && { log WARN "$(t cache_empty)"; return 1; }
+    while IFS=$'\t' read -r serial target label; do
+        [[ -z "${target:-}" ]] && continue
+        attach_known "$serial" "$target" "$label" && ok=true
     done <<< "$rows"
-    # catches paired devices whose wireless port changed after reboot / wifi toggle
-    while IFS=$'\t' read -r mserial t; do
-        [[ -z "$t" ]] && continue
-        if [[ "$(state_of "$t")" == "device" ]]; then
-            log OK "$(t already "$t")"; ok=true
-            [[ -n "$mserial" ]] && suspend_del "$mserial"
-            continue
-        fi
-        log INFO "$(t mdns "$t")"
-        if connect_target "" "${t%:*}" "${t##*:}"; then
-            ok=true; launch_scrcpy "$t" "$(device_label "$t")"
-            [[ -n "$mserial" ]] && {
-                suspend_del "$mserial"
-                cache_put "$mserial" "${t%:*}" "${t##*:}" \
-                    "$(device_label "$t")"
-            }
-        fi
-    done < <(mdns_entries)
     [[ "$ok" == true ]]
 }
 
 action_list() {
     printf '\n%s%s%s\n' "$BOLD" "$(t summary)" "$NC"
     local out
-    out=$(adb devices -l 2>/dev/null | awk 'NR>1 && NF>=2 {print}')
+    out=$(adbc devices -l 2>/dev/null | awk 'NR>1 && NF>=2 {print}')
     [[ -z "$out" ]] && { log INFO "$(t none_conn)"; return 0; }
     printf '%s\n' "$out" | sed 's/^/   /'
 }
 
 action_disconnect() { # suspends affected devices until the user reconnects
+    # Host-side only. The phone keeps its Wireless-debugging toggle exactly
+    # as the user left it: no `adb usb`, no `adb tcpip`, no adbd restart.
     local what="${1:-all}" target serial
     if [[ "$what" == "all" ]]; then
         while IFS= read -r target; do
             [[ -z "$target" ]] && continue
-            serial=$(adbq -s "$target" shell getprop ro.serialno 2>/dev/null \
-                | tr -d '\r\n')
+            serial=$(serial_of_target "$target")
             [[ -n "$serial" ]] && suspend_add "$serial"
-        done < <(adb devices 2>/dev/null \
+        done < <(adbc devices 2>/dev/null \
             | awk 'NR>1 && $2=="device" && $1 ~ /:/ {print $1}')
-        adb disconnect >/dev/null 2>&1
+        adbc disconnect >/dev/null 2>&1
         log OK "$(t disc "all")"
     else
-        serial=$(adbq -s "$what" shell getprop ro.serialno 2>/dev/null \
-            | tr -d '\r\n')
+        serial=$(serial_of_target "$what")
         [[ -n "$serial" ]] && suspend_add "$serial"
-        adb disconnect "$what" >/dev/null 2>&1
+        adbc disconnect "$what" >/dev/null 2>&1
         log OK "$(t disc "$what")"
     fi
 }
@@ -541,42 +703,64 @@ action_pair() { # Android 11+ wireless debugging
     [[ "$code" =~ ^[0-9]{6}$ ]] || { log ERR "$(t pair_fail)"; return 1; }
     if run_to 25 adb pair "$target" "$code" >>"$LOG_FILE" 2>&1; then
         log OK "$(t pair_ok "$target")"
-        # after pairing, the connect service uses a different port; discover it
-        local conn
-        conn=$(run_to 8 adb mdns services 2>/dev/null | awk '/_adb-tls-connect/ {print $NF; exit}')
-        [[ -n "$conn" ]] && connect_target "" "${conn%:*}" "${conn##*:}"
-        return 0
+        # The connect service runs on a different port than the pairing one
+        # and is published a moment later, so give the advert time to appear.
+        local conn waited=0 ident label
+        log INFO "$(t await_mdns)"
+        while (( waited < MDNS_WAIT )); do
+            conn=$(mdns_entries | awk -F'\t' 'NR==1 {print $2}')
+            [[ -n "${conn:-}" ]] && break
+            sleep 2; waited=$(( waited + 2 ))
+        done
+        [[ -z "${conn:-}" ]] && { log ERR "$(t pair_none)"; return 1; }
+        if connect_target "" "${conn%:*}" "${conn##*:}"; then
+            ident=$(serial_of_target "$conn")
+            label=$(device_label "$conn")
+            [[ -n "$ident" ]] && cache_put "$ident" "${conn%:*}" \
+                "${conn##*:}" "$label"
+            launch_scrcpy "$conn" "$label"
+            return 0
+        fi
+        return 1
     fi
     log ERR "$(t pair_fail)"; return 1
 }
 
-action_watch() { # automatic healing: NEVER touches user-suspended devices
+heal_one() { # serial target label - restore one dropped link, quietly
+    local serial="$1" target="$2" label="$3" fresh cand
+    [[ "$(state_of "$target")" == "device" ]] && alive "$target" && return 0
+    log WARN "$(t watch_lost "$target")"
+    # scrcpy stays on-demand here: popping a mirror window out of a background
+    # loop is intrusive.
+    fresh=$(mdns_target_for_serial "$serial")
+    for cand in "$fresh" "$target"; do
+        [[ -z "$cand" ]] && continue
+        if connect_target "$serial" "${cand%:*}" "${cand##*:}"; then
+            cache_put "$serial" "${cand%:*}" "${cand##*:}" "$label"
+            return 0
+        fi
+        [[ "$fresh" == "$target" ]] && break
+    done
+    return 1
+}
+
+watch_pass() { # one healing sweep; NEVER touches user-suspended devices
+    local serial target label
+    while IFS=$'\t' read -r serial target label; do
+        [[ -z "${target:-}" ]] && continue
+        is_suspended "$serial" && continue
+        # The lock is taken per device, not per pass. A manual command then
+        # waits for one device's worth of work at most, instead of for a whole
+        # sweep that can outlast the poll interval.
+        ( flock -w "$LOCK_WAIT" 9 || exit 0
+          heal_one "$serial" "$target" "$label" ) 9>"$LOCK_FILE"
+    done <<< "$(known_devices)"
+}
+
+action_watch() {
     log INFO "$(t watch "$WATCH_INTERVAL")"
-    local serial ip port label ts target t mserial
     while true; do
-        # shellcheck disable=SC2034
-        while IFS=$'\t' read -r serial ip port label ts; do
-            [[ -z "${ip:-}" ]] && continue
-            if is_suspended "$serial"; then continue; fi
-            target="$ip:$port"
-            if ! { [[ "$(state_of "$target")" == "device" ]] && alive "$target"; }; then
-                log WARN "$(t watch_lost "$target")"
-                # heal silently: auto-launching a mirror window from a
-                # background loop is intrusive — scrcpy stays on-demand
-                connect_target "" "$ip" "$port"
-            fi
-        done <<< "$(cache_rows)"
-        # pick up paired devices whose port changed (reboot / wifi toggle)
-        while IFS=$'\t' read -r mserial t; do
-            [[ -z "$t" ]] && continue
-            [[ -n "$mserial" ]] && is_suspended "$mserial" && continue
-            [[ "$(state_of "$t")" == "device" ]] && continue
-            log INFO "$(t mdns "$t")"
-            if connect_target "" "${t%:*}" "${t##*:}"; then
-                [[ -n "$mserial" ]] && cache_put "$mserial" \
-                    "${t%:*}" "${t##*:}" "$(device_label "$t")"
-            fi
-        done < <(mdns_entries)
+        watch_pass
         sleep "$WATCH_INTERVAL"
     done
 }
@@ -588,10 +772,11 @@ action_doctor() {
         if have "$tool"; then log OK "$tool -> $(command -v "$tool")"
         else log WARN "$tool -> missing"; fi
     done
-    log INFO "adb: $(adb version 2>/dev/null | head -1)"
+    log INFO "adb: $(adbc version 2>/dev/null | head -1)"
     log INFO "mdns : $(run_to 6 adb mdns check 2>&1 | tr -d '\r' | head -1)"
     log INFO "config: $CONFIG_FILE $( [[ -r $CONFIG_FILE ]] && echo '(loaded)' || echo '(defaults)')"
     log INFO "cache : $CACHE_FILE ($(cache_rows | grep -c . || true) devices)"
+    log INFO "known : $(known_devices | grep -c . || true) unique devices"
     log INFO "log   : $LOG_FILE"
     log INFO "lan   : $(ip -o -4 addr show scope global 2>/dev/null | awk '{printf "%s(%s) ", $2, $4}')"
     action_list
@@ -599,30 +784,35 @@ action_doctor() {
 
 usage() {
 cat <<EOF
-${BOLD}Auto ADB WiFi Connector v$VERSION${NC}
+${BOLD}ADB Wireless Manager v$VERSION${NC}
 
 Usage: $SCRIPT_NAME [command] [options]
 
 Commands:
-  connect            (default) enable TCP/IP over USB, connect and verify
-  reconnect, r       reconnect saved devices without a cable (cache + mDNS)
+  connect            (default) take USB-attached devices wireless and verify
+  reconnect, r       reconnect known devices without a cable (mDNS + cache)
   pair [host:port] [code]
-                     Android 11+ wireless debugging pairing (auto mDNS discovery)
-  watch, w           keep saved devices connected (auto healing loop)
+                     Android 11+ wireless pairing (auto mDNS discovery)
+  watch, w           keep known devices connected (healing loop)
   list, l            show current adb devices
-  disconnect [t|all] drop wireless connections
+  disconnect [t|all] drop wireless links on this machine
   doctor             environment + config diagnostics
   help               this screen
 
 Options:
-  -p, --port N       start port (default $START_PORT)
-  -r, --retries N    attempts per IP (default $MAX_RETRIES)
+  -p, --port N       start port for the tcpip fallback (default $START_PORT)
+  -r, --retries N    attempts per address (default $MAX_RETRIES)
   -s, --scrcpy       force scrcpy launch
   -S, --no-scrcpy    disable scrcpy
   -v, --verbose      debug output
   -q, --quiet        errors only
       --lang ar|en   force language
       --version
+
+On Android 11 and newer, connect uses the phone's wireless-debugging service
+discovered over mDNS. The classic 'adb tcpip' path is only used when that is
+unavailable, because it restarts adbd and switches the phone's
+Wireless-debugging toggle off.
 
 Config file: $CONFIG_FILE  (KEY=VALUE, e.g. AUTO_SCRCPY=false)
 Log file   : $LOG_FILE
@@ -663,7 +853,7 @@ have adb || die "$(t need adb)"
 # seed a documented config template once (never overwrite user edits)
 if [[ ! -e "$CONFIG_FILE" ]]; then
     cat >"$CONFIG_FILE" <<'TPL' 2>/dev/null
-# adbconnect config — single source of truth. Uncomment to override.
+# adbconnect config - single source of truth. Uncomment to override.
 #START_PORT=5555
 #MAX_RETRIES=3
 #CONNECT_TIMEOUT=6
@@ -678,19 +868,24 @@ if [[ ! -e "$CONFIG_FILE" ]]; then
 TPL
 fi
 
-# single instance guard: only for commands racing with the watch loop.
-# read-only / independent commands (list, doctor, disconnect) run lock-free
+# Mutual exclusion between connecting commands. The watch loop takes the lock
+# per pass (see action_watch) rather than for its whole lifetime, so a manual
+# `connect` or `reconnect` only ever waits for the current pass to finish
+# instead of being refused outright.
 case "$CMD" in
-    list|l|disconnect|doctor|help) LOCK_REQUIRED=false ;;
-    *)                             LOCK_REQUIRED=true ;;
+    list|l|disconnect|doctor|help|watch|w) LOCK_REQUIRED=false ;;
+    *)                                     LOCK_REQUIRED=true ;;
 esac
 
+# start adb server BEFORE taking the lock (a daemonized server would otherwise
+# inherit fd 9 and hold the lock forever)
+adbc start-server >>"$LOG_FILE" 2>&1
+
 if $LOCK_REQUIRED; then
-    # start adb server BEFORE taking the lock (daemonized server would
-    # otherwise inherit fd 9 and hold the lock forever)
-    adb start-server >>"$LOG_FILE" 2>&1
     exec 9>"$LOCK_FILE"
-    if ! flock -n 9 2>/dev/null; then die "$(t locked)"; fi
+    if ! flock -w "$LOCK_WAIT" 9 2>/dev/null; then
+        die "$(t locked "$LOCK_WAIT")"
+    fi
 fi
 
 # shellcheck disable=SC2317
@@ -699,9 +894,9 @@ trap cleanup EXIT
 trap 'printf "\n"; log WARN "interrupted"; exit 130' INT TERM
 
 if [[ "$QUIET" != true ]]; then
-    printf '%s══════════════════════════════════════════════%s\n' "$BLUE" "$NC"
-    printf '%s  📡 %s  v%s%s\n' "$BOLD" "$(t banner)" "$VERSION" "$NC"
-    printf '%s══════════════════════════════════════════════%s\n' "$BLUE" "$NC"
+    printf '%s==============================================%s\n' "$BLUE" "$NC"
+    printf '%s  %s  v%s%s\n' "$BOLD" "$(t banner)" "$VERSION" "$NC"
+    printf '%s==============================================%s\n' "$BLUE" "$NC"
 fi
 
 RC=0

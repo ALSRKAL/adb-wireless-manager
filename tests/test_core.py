@@ -208,16 +208,16 @@ class MdnsEntryTests(unittest.TestCase):
         self.assertEqual(pairs["192.168.100.65:44115"], "RZCN8017T9E")
 
     def test_cached_entries_include_serial(self):
+        """Serials are normalised on read so casing can never split a device."""
         fd, path = tempfile.mkstemp(suffix=".tsv")
         os.close(fd)
         orig = adbtray.CACHE_FILE
         adbtray.CACHE_FILE = path
         try:
             with open(path, "w", encoding="utf-8") as f:
-                f.write("MY serial\t10.0.0.9\t5555\tNexus\t123\n")
+                f.write("my serial\t10.0.0.9\t5555\tNexus\t123\n")
             rows = adbtray.cached_entries()
-            self.assertEqual(rows[0][0], "MY serial".upper().replace(
-                "MY SERIAL", "MY serial"))
+            self.assertEqual(rows[0][0], "MY SERIAL")
             self.assertEqual(rows[0][1], "10.0.0.9:5555")
             self.assertEqual(rows[0][2], "Nexus")
         finally:
@@ -560,7 +560,8 @@ class OpGateTests(unittest.TestCase):
                                return_value="TESTSER"):
             t.reconnect_one("1.2.3.4:5555", "")
             from PyQt5.QtWidgets import QApplication
-            deadline = time.time() + 5
+            # the verified-connect path retries with backoff before giving up
+            deadline = time.time() + 40
             while not msgs and time.time() < deadline:
                 QApplication.processEvents()
                 time.sleep(0.02)
@@ -758,6 +759,371 @@ class V13013Tests(unittest.TestCase):
         self.assertEqual(len(install_calls), 1,
                          f"queued install must execute exactly once, "
                          f"got {len(install_calls)}")
+
+
+PROBE_SAMPLE = """AWM_SERIAL=r5cx15d4p7p
+AWM_MODEL=SM_S928U1
+AWM_SDK=34
+AWM_WIFI=1
+AWM_BATTERY=73
+"""
+
+
+class IdentityTests(unittest.TestCase):
+    """Serial normalisation is the anchor for every de-duplication rule."""
+
+    def test_norm_serial_trims_and_uppercases(self):
+        self.assertEqual(adbtray.norm_serial("  r5cx15d4p7p\n"), "R5CX15D4P7P")
+        self.assertEqual(adbtray.norm_serial(None), "")
+        self.assertEqual(adbtray.norm_serial(""), "")
+
+    def test_split_target_handles_usb_serial(self):
+        self.assertEqual(adbtray.split_target("192.168.1.5:41234"),
+                         ("192.168.1.5", "41234"))
+        self.assertEqual(adbtray.split_target("R5CX15D4P7P"),
+                         ("R5CX15D4P7P", ""))
+        self.assertEqual(adbtray.target_host("10.0.0.9:5555"), "10.0.0.9")
+
+    def test_is_network_target(self):
+        self.assertTrue(adbtray.is_network_target("10.0.0.9:5555"))
+        self.assertTrue(adbtray.is_network_target("adb-XYZ-abc._tcp"))
+        self.assertFalse(adbtray.is_network_target("R5CX15D4P7P"))
+
+
+class DeviceProbeTests(unittest.TestCase):
+    def test_parses_every_field(self):
+        p = adbtray.parse_device_probe(PROBE_SAMPLE)
+        self.assertEqual(p["serial"], "R5CX15D4P7P")
+        self.assertEqual(p["model"], "SM S928U1")
+        self.assertEqual(p["sdk"], 34)
+        self.assertIs(p["adb_wifi"], True)
+        self.assertEqual(p["battery"], 73)
+        self.assertTrue(p["alive"])
+
+    def test_missing_fields_do_not_shift_others(self):
+        p = adbtray.parse_device_probe(
+            "AWM_SERIAL=ABC\nAWM_MODEL=\nAWM_SDK=\nAWM_WIFI=null\n"
+            "AWM_BATTERY=\n")
+        self.assertEqual(p["serial"], "ABC")
+        self.assertEqual(p["model"], "")
+        self.assertIsNone(p["sdk"])
+        self.assertIsNone(p["adb_wifi"])
+        self.assertIsNone(p["battery"])
+
+    def test_no_answer_is_not_alive(self):
+        p = adbtray.parse_device_probe("")
+        self.assertFalse(p["alive"])
+        self.assertEqual(p["serial"], "")
+
+    def test_garbage_output_is_not_alive(self):
+        p = adbtray.parse_device_probe("error: device offline\n")
+        self.assertFalse(p["alive"])
+
+    def test_wifi_off_is_false_not_none(self):
+        self.assertIs(adbtray.parse_device_probe("AWM_WIFI=0")["adb_wifi"],
+                      False)
+
+
+class ConnectStrategyTests(unittest.TestCase):
+    """`adb tcpip` restarts adbd and switches Wireless debugging off, so it
+    must be the last option, never the first."""
+
+    def test_existing_mdns_advert_wins(self):
+        self.assertEqual(
+            adbtray.plan_connect_strategy(34, True, "10.0.0.9:41234"),
+            (adbtray.STRATEGY_MDNS, "10.0.0.9:41234"))
+
+    def test_mdns_advert_wins_even_on_legacy_android(self):
+        self.assertEqual(
+            adbtray.plan_connect_strategy(28, None, "10.0.0.9:5555"),
+            (adbtray.STRATEGY_MDNS, "10.0.0.9:5555"))
+
+    def test_modern_without_advert_enables_wireless_debugging(self):
+        self.assertEqual(adbtray.plan_connect_strategy(30, False, ""),
+                         (adbtray.STRATEGY_ENABLE_WIFI, ""))
+        self.assertEqual(adbtray.plan_connect_strategy(34, None, ""),
+                         (adbtray.STRATEGY_ENABLE_WIFI, ""))
+
+    def test_modern_with_toggle_on_waits_instead_of_restarting_adbd(self):
+        self.assertEqual(adbtray.plan_connect_strategy(33, True, ""),
+                         (adbtray.STRATEGY_AWAIT_MDNS, ""))
+
+    def test_legacy_android_uses_tcpip(self):
+        self.assertEqual(adbtray.plan_connect_strategy(29, None, ""),
+                         (adbtray.STRATEGY_TCPIP, ""))
+
+    def test_unknown_sdk_uses_tcpip(self):
+        self.assertEqual(adbtray.plan_connect_strategy(None, None, ""),
+                         (adbtray.STRATEGY_TCPIP, ""))
+
+    def test_boundary_is_android_11(self):
+        self.assertEqual(adbtray.WIRELESS_DEBUGGING_SDK, 30)
+        self.assertEqual(adbtray.plan_connect_strategy(30, None, "")[0],
+                         adbtray.STRATEGY_ENABLE_WIFI)
+        self.assertEqual(adbtray.plan_connect_strategy(29, None, "")[0],
+                         adbtray.STRATEGY_TCPIP)
+
+
+class NoAdbdRestartOnHealingTests(unittest.TestCase):
+    """Source guard for the reported bug: disconnecting or healing a link must
+    never restart adbd, because that is what switches the phone's
+    Wireless-debugging toggle off."""
+
+    ROOT = os.path.join(os.path.dirname(__file__), "..")
+
+    def _read(self, rel):
+        with open(os.path.join(self.ROOT, rel), encoding="utf-8") as f:
+            return f.read()
+
+    # invocation shapes only, so the field name `"usb"` and prose mentioning
+    # the command in comments do not trip the guard
+    ADB_USB_CALLS = (
+        r'\[\s*"adb"[^\]]*"usb"',          # python:  ["adb", "-s", s, "usb"]
+        r'\badbq?\s+-s\s+"?\$\{?\w+\}?"?\s+usb\b',   # bash:  adb -s "$s" usb
+        r'\badb\s+-s\s+\$\w+\s+usb\b',     # powershell: adb -s $s usb
+    )
+
+    def test_no_source_invokes_adb_usb(self):
+        for rel in ("tray/adbtray.py", "scripts/adbconnect.sh",
+                    "scripts/adbconnect.ps1"):
+            text = self._read(rel)
+            for pattern in self.ADB_USB_CALLS:
+                self.assertIsNone(
+                    re.search(pattern, text),
+                    f"{rel} must not run `adb usb`: it drops the wireless "
+                    f"listener and turns the toggle off")
+
+    def test_healing_uses_adb_reconnect_offline(self):
+        self.assertIn("reconnect", adbtray.heal_offline_transport.__doc__ or "")
+        for rel in ("tray/adbtray.py", "scripts/adbconnect.sh",
+                    "scripts/adbconnect.ps1"):
+            self.assertIn("reconnect", self._read(rel))
+
+    def test_tcpip_paths_restore_the_wireless_toggle(self):
+        tray = self._read("tray/adbtray.py")
+        self.assertIn("adb_wifi_enabled", tray)
+        self.assertIn("enable_wireless_debugging", tray)
+        sh_src = self._read("scripts/adbconnect.sh")
+        self.assertIn("enable_wireless_debugging", sh_src)
+        self.assertIn("adb_wifi_enabled", sh_src)
+
+    def test_tool_output_carries_no_emoji(self):
+        """No emoji anywhere in the shipped tools."""
+        for rel in ("tray/adbtray.py", "scripts/adbconnect.sh",
+                    "scripts/adbconnect.ps1", "install.sh", "install.ps1",
+                    "uninstall.sh", "tests/run_tests.sh",
+                    "README.md", "README.ar.md"):
+            for ch in self._read(rel):
+                o = ord(ch)
+                self.assertFalse(
+                    0x1F000 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF
+                    or o in (0x2B50, 0xFE0F, 0x2705, 0x274C, 0x23F3, 0x23FA),
+                    f"{rel} contains the decorative glyph {ch!r}")
+
+
+class FriendlyConnectErrorTests(unittest.TestCase):
+    def test_success_has_no_reason(self):
+        self.assertEqual(
+            adbtray.friendly_connect_error("connected to 10.0.0.9:5555"), "")
+
+    def test_refused_explains_the_toggle(self):
+        msg = adbtray.friendly_connect_error(
+            "failed to connect to '10.0.0.9:5555': Connection refused")
+        self.assertTrue(msg)
+        self.assertNotIn("unknown", msg.lower())
+
+    def test_unreachable_and_timeout_are_distinct(self):
+        a = adbtray.friendly_connect_error("No route to host")
+        b = adbtray.friendly_connect_error("Operation timed out")
+        self.assertTrue(a and b)
+        self.assertNotEqual(a, b)
+
+    def test_unknown_output_keeps_the_raw_line(self):
+        self.assertIn("something odd",
+                      adbtray.friendly_connect_error("something odd"))
+
+
+class MergeDeviceViewTests(unittest.TestCase):
+    """The duplicate-row bug: one phone answers to a USB serial, a stale
+    cached ip:5555 and a fresh mDNS ip:41234 at the same time."""
+
+    SER = "R5CX15D4P7P"
+
+    def test_stale_cache_and_fresh_mdns_collapse_into_one_row(self):
+        rows = adbtray.merge_device_view(
+            devices=[{"serial": "192.168.1.5:41234", "state": "device",
+                      "model": "SM S928U1", "usb": False}],
+            serial_by_target={"192.168.1.5:41234": self.SER},
+            cached=[(self.SER, "192.168.1.5:5555", "SM S928U1")],
+            mdns=[(self.SER, "192.168.1.5:41234")],
+            suspended=[])
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["online"])
+        self.assertEqual(rows[0]["net_target"], "192.168.1.5:41234")
+        self.assertEqual(rows[0]["tag"], adbtray.TAG_WIFI)
+
+    def test_usb_and_wireless_link_are_the_same_device(self):
+        rows = adbtray.merge_device_view(
+            devices=[{"serial": self.SER, "state": "device",
+                      "model": "SM S928U1", "usb": True},
+                     {"serial": "192.168.1.5:41234", "state": "device",
+                      "model": "SM S928U1", "usb": False}],
+            serial_by_target={self.SER: self.SER,
+                              "192.168.1.5:41234": self.SER},
+            cached=[(self.SER, "192.168.1.5:41234", "SM S928U1")],
+            mdns=[],
+            suspended=[])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tag"], adbtray.TAG_BOTH)
+        # device operations prefer the steadier USB link
+        self.assertEqual(rows[0]["target"], self.SER)
+
+    def test_serial_casing_never_splits_a_device(self):
+        rows = adbtray.merge_device_view(
+            devices=[],
+            serial_by_target={},
+            cached=[("r5cx15d4p7p", "192.168.1.5:5555", "Phone")],
+            mdns=[("R5CX15D4P7P", "192.168.1.5:41234")],
+            suspended=[])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["serial"], self.SER)
+
+    def test_fresh_mdns_port_is_preferred_for_reconnecting(self):
+        rows = adbtray.merge_device_view(
+            devices=[], serial_by_target={},
+            cached=[(self.SER, "192.168.1.5:5555", "Phone")],
+            mdns=[(self.SER, "192.168.1.5:41234")],
+            suspended=[])
+        self.assertEqual(rows[0]["known_target"], "192.168.1.5:41234")
+        self.assertFalse(rows[0]["online"])
+
+    def test_two_phones_stay_two_rows(self):
+        rows = adbtray.merge_device_view(
+            devices=[], serial_by_target={},
+            cached=[("SER_A", "192.168.1.5:5555", "A"),
+                    ("SER_B", "192.168.1.6:5555", "B")],
+            mdns=[], suspended=[])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r["serial"] for r in rows}, {"SER_A", "SER_B"})
+
+    def test_recycled_dhcp_lease_does_not_fuse_two_phones(self):
+        rows = adbtray.merge_device_view(
+            devices=[], serial_by_target={},
+            cached=[("SER_OLD", "192.168.1.5:5555", "old phone")],
+            mdns=[("SER_NEW", "192.168.1.5:41234")],
+            suspended=[])
+        self.assertEqual(len(rows), 2,
+                         "same address but different serials are not one phone")
+
+    def test_cache_row_without_serial_merges_on_address(self):
+        rows = adbtray.merge_device_view(
+            devices=[], serial_by_target={},
+            cached=[("", "192.168.1.5:5555", "legacy row")],
+            mdns=[(self.SER, "192.168.1.5:41234")],
+            suspended=[])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["serial"], self.SER)
+
+    def test_suspended_flag_only_applies_while_offline(self):
+        offline = adbtray.merge_device_view(
+            devices=[], serial_by_target={},
+            cached=[(self.SER, "192.168.1.5:5555", "Phone")],
+            mdns=[], suspended=[self.SER.lower()])
+        self.assertTrue(offline[0]["suspended"])
+        online = adbtray.merge_device_view(
+            devices=[{"serial": "192.168.1.5:5555", "state": "device",
+                      "model": "Phone", "usb": False}],
+            serial_by_target={"192.168.1.5:5555": self.SER},
+            cached=[(self.SER, "192.168.1.5:5555", "Phone")],
+            mdns=[], suspended=[self.SER])
+        self.assertFalse(online[0]["suspended"])
+
+    def test_unauthorized_device_is_not_online(self):
+        rows = adbtray.merge_device_view(
+            devices=[{"serial": self.SER, "state": "unauthorized",
+                      "model": self.SER, "usb": True}],
+            serial_by_target={}, cached=[], mdns=[], suspended=[])
+        self.assertFalse(rows[0]["online"])
+        self.assertEqual(rows[0]["state"], "unauthorized")
+
+    def test_alias_wins_over_model(self):
+        rows = adbtray.merge_device_view(
+            devices=[{"serial": self.SER, "state": "device",
+                      "model": "SM S928U1", "usb": True}],
+            serial_by_target={self.SER: self.SER},
+            cached=[], mdns=[], suspended=[],
+            aliases={self.SER: "Work phone"})
+        self.assertEqual(rows[0]["label"], "Work phone")
+
+    def test_battery_is_carried_on_the_row(self):
+        rows = adbtray.merge_device_view(
+            devices=[{"serial": self.SER, "state": "device",
+                      "model": "P", "usb": True}],
+            serial_by_target={self.SER: self.SER},
+            cached=[], mdns=[], suspended=[],
+            batteries={self.SER: 42})
+        self.assertEqual(rows[0]["battery"], 42)
+
+    def test_empty_world_is_an_empty_view(self):
+        self.assertEqual(
+            adbtray.merge_device_view([], {}, [], [], []), [])
+
+    def test_signature_changes_only_with_visible_state(self):
+        args = ([], {}, [(self.SER, "1.2.3.4:5555", "P")], [], [])
+        a = adbtray.view_signature(adbtray.merge_device_view(*args), "ar")
+        b = adbtray.view_signature(adbtray.merge_device_view(*args), "ar")
+        self.assertEqual(a, b)
+        c = adbtray.view_signature(adbtray.merge_device_view(*args), "en")
+        self.assertNotEqual(a, c)
+
+
+class CacheDeduplicationTests(unittest.TestCase):
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".tsv")
+        os.close(fd)
+        self._orig = adbtray.CACHE_FILE
+        adbtray.CACHE_FILE = self.path
+
+    def tearDown(self):
+        adbtray.CACHE_FILE = self._orig
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    def _write(self, text):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_rotated_port_replaces_the_row(self):
+        adbtray.save_cache_entry("SER1", "10.0.0.5:5555", "Phone")
+        adbtray.save_cache_entry("SER1", "10.0.0.5:41234", "Phone")
+        rows = adbtray.cached_entries()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "10.0.0.5:41234")
+
+    def test_serial_casing_does_not_create_a_second_row(self):
+        adbtray.save_cache_entry("ser1", "10.0.0.5:5555", "Phone")
+        adbtray.save_cache_entry("SER1", "10.0.0.9:5555", "Phone")
+        self.assertEqual(len(adbtray.cached_entries()), 1)
+
+    def test_new_device_on_a_recycled_address_replaces_the_old_row(self):
+        adbtray.save_cache_entry("OLD", "10.0.0.5:5555", "Old")
+        adbtray.save_cache_entry("NEW", "10.0.0.5:5555", "New")
+        rows = adbtray.cached_entries()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "NEW")
+
+    def test_legacy_duplicated_file_is_repaired_on_read(self):
+        self._write("SER1\t10.0.0.5\t5555\tPhone\t1\n"
+                    "ser1\t10.0.0.5\t41234\tPhone\t2\n"
+                    "SER2\t10.0.0.6\t5555\tOther\t3\n")
+        rows = adbtray.cached_entries()
+        self.assertEqual(len(rows), 2)
+        by_serial = {s: t for s, t, _ in rows}
+        self.assertEqual(by_serial["SER1"], "10.0.0.5:41234")
+
+    def test_short_and_blank_lines_are_ignored(self):
+        self._write("\nbroken\nSER1\t10.0.0.5\t5555\tPhone\t1\n")
+        self.assertEqual(len(adbtray.cached_entries()), 1)
 
 
 if __name__ == "__main__":

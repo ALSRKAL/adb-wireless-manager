@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QMenu, QMessageBox, QProgressBar, QPushButton,
                              QSpinBox, QSystemTrayIcon, QVBoxLayout, QWidget)
 
-__version__ = "13.0.13"
+__version__ = "14.0.0"
 REPO = "ALSRKAL/adb-wireless-manager"
 REPO_URL = f"https://github.com/{REPO}"
 
@@ -152,6 +152,33 @@ def tr(ar, en):
     return en if S.get("lang") == "en" else ar
 
 
+# ---------------------------------------------------------------------------
+# Device identity - one normalisation rule for the whole app.
+# A phone answers to several names at once (USB serial, cached ip:5555, a
+# fresh mDNS ip:41234). Every comparison goes through these helpers so the
+# same phone is never counted twice.
+# ---------------------------------------------------------------------------
+def norm_serial(value):
+    """Canonical form of a hardware serial used as the identity key."""
+    return (value or "").strip().upper()
+
+
+def is_network_target(value):
+    """True when the adb transport name is a wireless one, not a USB serial."""
+    value = value or ""
+    return ":" in value or value.startswith("adb-")
+
+
+def split_target(target):
+    """'192.168.1.5:41234' -> ('192.168.1.5', '41234'); USB serial -> (s, '')."""
+    host, sep, port = (target or "").rpartition(":")
+    return (host, port) if sep else ((target or ""), "")
+
+
+def target_host(target):
+    return split_target(target)[0]
+
+
 _tray_ref = None
 
 
@@ -228,17 +255,29 @@ def list_devices():
 
 
 def cached_entries():
-    rows = []
+    """Saved devices as (serial, target, label). Last row per serial wins.
+
+    Older builds wrote the same phone twice when its serial casing or its
+    wireless port changed, so collapsing on the normalised serial here also
+    repairs caches written by those builds.
+    """
+    rows = {}
+    order = []
     try:
         with open(CACHE_FILE, encoding="utf-8") as f:
             for line in f:
                 c = line.rstrip("\n").split("\t")
-                if len(c) >= 4:
-                    rows.append((c[0], c[1] + ":" + c[2],
-                                 c[3].replace("_", " ")))
+                if len(c) < 4:
+                    continue
+                serial = norm_serial(c[0])
+                key = serial or f"{c[1]}:{c[2]}"
+                if key not in rows:
+                    order.append(key)
+                rows[key] = (serial, f"{c[1]}:{c[2]}",
+                             c[3].replace("_", " "))
     except OSError:
         pass
-    return rows
+    return [rows[k] for k in order]
 
 
 def cached_targets():
@@ -377,14 +416,27 @@ def mdns_target_for_serial(entries, serial):
 
 
 def save_cache_entry(serial, target, label):
-    host, _, port = target.rpartition(":")
+    """Upsert one row per device, keyed on the normalised serial.
+
+    Also drops any other row pointing at the same address, so a phone whose
+    wireless port changed replaces its old entry instead of adding one.
+    """
+    serial = norm_serial(serial)
+    host, port = split_target(target)
     try:
         os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
         rows = []
         try:
             with open(CACHE_FILE, encoding="utf-8") as f:
-                rows = [l for l in f.readlines()
-                        if l.split("\t")[0].strip() != serial]
+                for line in f.readlines():
+                    c = line.rstrip("\n").split("\t")
+                    if len(c) < 4:
+                        continue
+                    if serial and norm_serial(c[0]) == serial:
+                        continue
+                    if host and c[1] == host:
+                        continue
+                    rows.append(line if line.endswith("\n") else line + "\n")
         except OSError:
             pass
         rows.append(f"{serial}\t{host}\t{port}\t{label}\t"
@@ -444,8 +496,8 @@ def evaluate_readiness(dev_state=None, wifi_dbg=None):
                       "Enable Developer options (tap Build number 7 times)"))
     else:
         items.append((True,
-                      "خيارات المطوّر مفعّلة ✓",
-                      "Developer options enabled ✓"))
+                      "خيارات المطوّر مفعّلة",
+                      "Developer options enabled"))
 
     if dev_state == "unauthorized":
         items.append((False,
@@ -453,12 +505,12 @@ def evaluate_readiness(dev_state=None, wifi_dbg=None):
                       "Accept the authorization prompt on the phone"))
     elif dev_state == "device":
         items.append((True,
-                      "USB debugging مفعّل ويعمل ✓",
-                      "USB debugging enabled and working ✓"))
+                      "USB debugging مفعّل ويعمل",
+                      "USB debugging enabled and working"))
     elif dev_state == "offline":
         items.append((False,
-                      "الجهاز offline — أعد توصيل الكابل",
-                      "Device offline — reconnect the cable"))
+                      "الجهاز offline - أعد توصيل الكابل",
+                      "Device offline - reconnect the cable"))
     else:
         items.append((None,
                       "لتوصيل USB: فعّل USB debugging من خيارات المطوّر",
@@ -466,8 +518,8 @@ def evaluate_readiness(dev_state=None, wifi_dbg=None):
 
     if wifi_dbg is True:
         items.append((True,
-                      "Wireless debugging مفعّل ✓ — تابع الاقتران",
-                      "Wireless debugging ON ✓ — proceed to pairing"))
+                      "Wireless debugging مفعّل - تابع الاقتران",
+                      "Wireless debugging is on - proceed to pairing"))
     elif wifi_dbg is False:
         items.append((False,
                       "فعّل Wireless debugging من خيارات المطوّر",
@@ -522,22 +574,230 @@ def phone_ips(serial):
     return wlan + other
 
 
+# One round-trip per device instead of one per fact. Values are echoed with
+# explicit keys so a missing field cannot shift the rest of the output.
+DEVICE_PROBE_CMD = (
+    "echo AWM_SERIAL=$(getprop ro.serialno); "
+    "echo AWM_MODEL=$(getprop ro.product.model); "
+    "echo AWM_SDK=$(getprop ro.build.version.sdk); "
+    "echo AWM_WIFI=$(settings get global adb_wifi_enabled); "
+    "echo AWM_BATTERY=$(dumpsys battery | sed -n 's/^  level: //p')"
+)
+
+EMPTY_PROBE = {"serial": "", "model": "", "sdk": None,
+               "adb_wifi": None, "battery": None, "alive": False}
+
+
+def parse_device_probe(text):
+    """Pure parser for DEVICE_PROBE_CMD output.
+
+    `alive` means the shell actually answered, which is the only honest
+    proof that a transport listed as `device` can still run commands.
+    """
+    out = dict(EMPTY_PROBE)
+    for line in (text or "").splitlines():
+        key, sep, val = line.strip().partition("=")
+        if not sep or not key.startswith("AWM_"):
+            continue
+        out["alive"] = True
+        val = val.strip()
+        if key == "AWM_SERIAL":
+            out["serial"] = norm_serial(val)
+        elif key == "AWM_MODEL":
+            out["model"] = val.replace("_", " ")
+        elif key == "AWM_SDK":
+            out["sdk"] = int(val) if val.isdigit() else None
+        elif key == "AWM_WIFI":
+            out["adb_wifi"] = {"1": True, "0": False}.get(val)
+        elif key == "AWM_BATTERY":
+            out["battery"] = int(val) if val.isdigit() else None
+    return out
+
+
+def probe_device(target, timeout=8):
+    """Ask a live transport who it is. Never raises."""
+    return parse_device_probe(
+        sh(["adb", "-s", target, "shell", DEVICE_PROBE_CMD], timeout))
+
+
 def device_serial(target):
-    out = sh(["adb", "-s", target, "shell",
-              "getprop", "ro.serialno"], 6).strip()
-    if out:
-        return out.upper()
+    """Hardware serial behind an adb transport, mDNS as the fallback."""
+    serial = probe_device(target, 6)["serial"]
+    if serial:
+        return serial
     for mserial, t in mdns_entries():
         if t == target:
-            return mserial
+            return norm_serial(mserial)
     return ""
 
 
-def device_battery(serial):
-    out = sh(["adb", "-s", serial, "shell",
-              "dumpsys battery | grep -E '^  level'"], 5)
-    m = re.search(r"level:\s*(\d+)", out)
-    return int(m.group(1)) if m else None
+# ---------------------------------------------------------------------------
+# Connection layer
+#
+# `adb tcpip <port>` and `adb usb` both restart adbd on the phone. On
+# Android 11+ that restart tears down the Wireless-debugging session and
+# leaves the developer-options toggle switched off, which is exactly what
+# users hit after a failed reconnect. Both commands are therefore treated
+# as a last resort, and never as part of routine healing.
+# ---------------------------------------------------------------------------
+WIRELESS_DEBUGGING_SDK = 30          # Android 11
+MDNS_WAIT_SECONDS = 20
+STRATEGY_MDNS = "mdns"
+STRATEGY_ENABLE_WIFI = "enable_wifi"
+STRATEGY_AWAIT_MDNS = "await_mdns"
+STRATEGY_TCPIP = "tcpip"
+
+
+def plan_connect_strategy(sdk, adb_wifi_enabled, mdns_target):
+    """Pure: decide how to take a USB-attached phone wireless.
+
+    Returns (strategy, target):
+      mdns         already advertising - just connect, touch nothing
+      enable_wifi  Android 11+ - switch Wireless debugging on, then wait
+      await_mdns   Android 11+ toggle already on - wait for the advert
+      tcpip        legacy fallback - restarts adbd, drops the toggle
+    """
+    modern = sdk is not None and sdk >= WIRELESS_DEBUGGING_SDK
+    if mdns_target:
+        return STRATEGY_MDNS, mdns_target
+    if not modern:
+        return STRATEGY_TCPIP, ""
+    if adb_wifi_enabled is True:
+        return STRATEGY_AWAIT_MDNS, ""
+    return STRATEGY_ENABLE_WIFI, ""
+
+
+HARD_CONNECT_FAILURES = ("refused", "no route to host",
+                         "network is unreachable", "host is unreachable",
+                         "name or service not known", "unknown host")
+
+
+def is_hard_connect_failure(output):
+    """True when retrying the same address cannot help.
+
+    A refused connection means nothing is listening on that port right now,
+    usually a stale mDNS advert or a wireless-debugging toggle that went off.
+    Retrying it three times only makes the tool feel slow; moving on to the
+    next candidate address is what actually recovers the link.
+    """
+    out = (output or "").lower()
+    return any(sig in out for sig in HARD_CONNECT_FAILURES)
+
+
+def friendly_connect_error(output):
+    """Turn raw `adb connect` output into a reason worth showing a user."""
+    out = (output or "").lower()
+    if "connected to" in out:
+        return ""
+    if not out.strip():
+        # adb was killed by our timeout before it printed anything, which is
+        # what an unroutable address looks like from here
+        return tr("لا استجابة خلال المهلة - العنوان غير قابل للوصول",
+                  "no answer within the timeout - the address is unreachable")
+    if "refused" in out:
+        return tr("الهاتف رفض الاتصال - التصحيح اللاسلكي مغلق أو المنفذ تغيّر",
+                  "connection refused - wireless debugging is off or the "
+                  "port changed")
+    if "no route to host" in out or "network is unreachable" in out:
+        return tr("لا يوجد مسار للهاتف - تأكد أنكما على نفس الشبكة",
+                  "no route to the phone - check you are on the same network")
+    if "timed out" in out or "timeout" in out:
+        return tr("انتهت المهلة - الهاتف نائم أو الشبكة بطيئة",
+                  "timed out - the phone is asleep or the network is slow")
+    if "failed to authenticate" in out or "unauthorized" in out:
+        return tr("التخويل مرفوض - أعد الاقتران",
+                  "not authorised - pair again")
+    if "cannot connect" in out or "failed to connect" in out:
+        return tr("تعذّر الوصول إلى العنوان",
+                  "the address could not be reached")
+    line = next((l.strip() for l in (output or "").splitlines() if l.strip()),
+                "")
+    return line or tr("سبب غير معروف", "unknown reason")
+
+
+def target_state(target, devices=None):
+    """adb's own opinion about one transport, or None when it is unknown."""
+    for d in (devices if devices is not None else list_devices()):
+        if d["serial"] == target:
+            return d["state"]
+    return None
+
+
+def heal_offline_transport(target):
+    """Clear a half-open transport without restarting adbd on the phone.
+
+    `adb reconnect offline` is adb's own remedy for stuck transports and
+    costs the phone nothing, unlike `adb usb` / `adb tcpip`.
+    """
+    sh(["adb", "disconnect", target], 6)
+    sh(["adb", "reconnect", "offline"], 8)
+
+
+def enable_wireless_debugging(serial):
+    """Switch Wireless debugging on over an existing transport.
+
+    The adb shell user holds WRITE_SECURE_SETTINGS, so this is also how a
+    toggle that a previous adbd restart switched off gets restored.
+    """
+    sh(["adb", "-s", serial, "shell", "settings", "put", "global",
+        "adb_wifi_enabled", "1"], 8)
+    return probe_device(serial, 8)["adb_wifi"] is True
+
+
+def wait_for_mdns_target(serial, deadline_sec=MDNS_WAIT_SECONDS):
+    """Poll mDNS for this phone's wireless-debugging advert."""
+    want = norm_serial(serial)
+    deadline = time.time() + deadline_sec
+    while True:
+        entries = mdns_entries()
+        hit = mdns_target_for_serial(entries, want) if want else None
+        if hit:
+            return hit
+        if time.time() >= deadline:
+            return ""
+        time.sleep(2)
+
+
+def connect_and_verify(target, expect_serial="", attempts=None):
+    """Connect, then prove the link with a real command round-trip.
+
+    Returns (ok, serial, reason). The identity check is what stops the
+    tool from silently adopting a different phone that picked up the same
+    DHCP address.
+    """
+    tries = attempts or max(1, int(S.get("max_retries") or 3))
+    timeout = max(4, int(S.get("connect_timeout_sec") or 10))
+    want = norm_serial(expect_serial)
+    reason = tr("لم تبدأ أي محاولة", "no attempt was made")
+    for attempt in range(1, tries + 1):
+        out = sh(["adb", "connect", target], timeout)
+        time.sleep(1)
+        state = target_state(target)
+        if state == "device":
+            probe = probe_device(target)
+            if not probe["alive"]:
+                reason = tr("الاتصال قائم لكن الجهاز لا يستجيب للأوامر",
+                            "linked but the device answers no commands")
+                heal_offline_transport(target)
+            elif want and probe["serial"] and probe["serial"] != want:
+                sh(["adb", "disconnect", target], 6)
+                return False, probe["serial"], tr(
+                    f"العنوان {target} يخص جهازًا آخر ({probe['serial']})",
+                    f"{target} belongs to a different device "
+                    f"({probe['serial']})")
+            else:
+                return True, probe["serial"], ""
+        elif state == "offline":
+            reason = tr("الاتصال معلّق في حالة offline",
+                        "the transport is stuck offline")
+            heal_offline_transport(target)
+        else:
+            reason = friendly_connect_error(out)
+            if is_hard_connect_failure(out):
+                return False, "", reason      # try the next address instead
+        if attempt < tries:
+            time.sleep(min(3, attempt))
+    return False, "", reason
 
 
 def scrcpy_running(target):
@@ -615,8 +875,8 @@ def friendly_adb_error(output):
         return tr("مساحة التخزين ممتلئة على الجهاز",
                   "Device storage is full")
     if "install_failed_version_downgrade" in out:
-        return tr("نسخة أقدم من المثبتة حاليًا — احذف القديم أولًا",
-                  "older than the installed one — uninstall first")
+        return tr("نسخة أقدم من المثبتة حاليًا - احذف القديم أولًا",
+                  "older than the installed one - uninstall first")
     if "install_failed_already_exists" in out:
         return tr("نفس النسخة مثبتة مسبقًا",
                   "the same version is already installed")
@@ -624,9 +884,9 @@ def friendly_adb_error(output):
         return tr("التطبيق غير متوافق مع هذا الجهاز",
                   "app is incompatible with this device")
     if "signature" in out or "update_ownership" in out:
-        return tr("توقيع مختلف عن النسخة المثبتة — احذف القديم أولًا",
+        return tr("توقيع مختلف عن النسخة المثبتة - احذف القديم أولًا",
                   "different signature than the installed "
-                  "copy — uninstall first")
+                  "copy - uninstall first")
     if "install_canceled_by_user" in out or "cancelled" in out \
             or "canceled" in out:
         return tr("أُلغي التثبيت من الجهاز (وافق على النافذة على الشاشة)",
@@ -635,11 +895,11 @@ def friendly_adb_error(output):
         return tr("ملف APK تالف أو غير صالح", "APK file is corrupt/invalid")
     if "offline" in out or "device not found" in out \
             or "device .* offline" in out or "'adb devices'" in out:
-        return tr("الجهاز غير متصل — تأكد من الاتصال",
-                  "device is offline — check the connection")
+        return tr("الجهاز غير متصل - تأكد من الاتصال",
+                  "device is offline - check the connection")
     if "timeout" in out or "timed out" in out:
-        return tr("انتهت المهلة — الاتصال بطيء",
-                  "timed out — connection too slow")
+        return tr("انتهت المهلة - الاتصال بطيء",
+                  "timed out - connection too slow")
     line = next((ln.strip() for ln in (output or "").splitlines()
                  if ln.strip() and "performing streamed install"
                  not in ln.lower()), "")
@@ -659,7 +919,7 @@ class InstallProgressDialog(QDialog):
         self.setModal(False)
         self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
         lay = QVBoxLayout(self)
-        self.file_label = QLabel("…")
+        self.file_label = QLabel("...")
         lay.addWidget(self.file_label)
         self.bar = QProgressBar()
         self.bar.setRange(0, max(1, total))
@@ -683,7 +943,7 @@ class InstallProgressDialog(QDialog):
 
     def _on_finish(self):
         # runs on the GUI thread (queued from the worker via the signal);
-        # bar stays honest — no fake jump to 100% on cancel
+        # bar stays honest - no fake jump to 100% on cancel
         self.cancel_btn.setEnabled(False)
         self.close()
 
@@ -698,7 +958,7 @@ class InstallProgressDialog(QDialog):
         self._cancel_requested = True
         self.cancel_btn.setEnabled(False)
         self.file_label.setText(
-            tr("جارٍ إلغاء العملية الحالية…", "Cancelling current file…"))
+            tr("جارٍ إلغاء العملية الحالية...", "Cancelling current file..."))
 
     def finish(self):
         # thread-safe: emitting a signal queues onto the GUI event loop
@@ -755,9 +1015,126 @@ def version_is_newer(a, b):
 
 
 def resolve_label(serial, model, aliases):
+    aliases = aliases or {}
+    serial = serial or ""
     a = aliases.get(serial) or aliases.get(serial.upper()) \
         or aliases.get(serial.lower())
     return a if a else model
+
+
+# ---------------------------------------------------------------------------
+# Device view: collapse every name a phone answers to into a single row.
+# ---------------------------------------------------------------------------
+TAG_USB = "USB"
+TAG_WIFI = "WiFi"
+TAG_BOTH = "USB+WiFi"
+
+
+def merge_device_view(devices, serial_by_target, cached, mdns, suspended,
+                      aliases=None, batteries=None):
+    """Pure: one row per physical device out of transports, cache and mDNS.
+
+    The same phone routinely appears three times at once - as a USB serial,
+    as the stale `ip:5555` in the cache, and as a fresh `ip:41234` mDNS
+    advert after its wireless port rotated. Rows are keyed on the hardware
+    serial, falling back to the host address when no serial is known yet.
+    Two rows are never merged on address alone if both carry serials that
+    disagree, so a recycled DHCP lease cannot fuse two different phones.
+    """
+    aliases = aliases or {}
+    batteries = batteries or {}
+    suspended = {norm_serial(s) for s in (suspended or ())}
+    rows, by_serial, by_host = [], {}, {}
+
+    def find(serial, host):
+        row = by_serial.get(serial) if serial else None
+        if row is not None:
+            return row
+        row = by_host.get(host) if host else None
+        if row is not None and serial and row["serial"] \
+                and row["serial"] != serial:
+            return None
+        return row
+
+    def ensure(serial, host):
+        serial = norm_serial(serial)
+        row = find(serial, host)
+        if row is None:
+            row = {"serial": serial, "state": None, "usb_target": "",
+                   "net_target": "", "mdns_target": "", "cached_target": "",
+                   "live_model": "", "cached_label": "", "battery": None}
+            rows.append(row)
+        if serial:
+            if not row["serial"]:
+                row["serial"] = serial
+            by_serial.setdefault(serial, row)
+        if host:
+            by_host.setdefault(host, row)
+        return row
+
+    # Live transports first: they carry the most trustworthy identity.
+    for d in devices:
+        target = d["serial"]
+        usb = d["usb"]
+        serial = target if usb else serial_by_target.get(target, "")
+        row = ensure(serial, "" if usb else target_host(target))
+        if usb:
+            row["usb_target"] = target
+        else:
+            row["net_target"] = target
+        if row["state"] != "device":
+            row["state"] = d["state"]
+        if d["model"] and d["model"] != target:
+            row["live_model"] = d["model"]
+        bat = batteries.get(target)
+        if bat is not None:
+            row["battery"] = bat
+
+    for serial, target in mdns:
+        ensure(serial, target_host(target))["mdns_target"] = target
+
+    for serial, target, label in cached:
+        row = ensure(serial, target_host(target))
+        row["cached_target"] = target
+        if label and label != "mDNS" and not row["cached_label"]:
+            row["cached_label"] = label
+
+    out = []
+    for row in rows:
+        row["online"] = bool(row["usb_target"] or row["net_target"]) \
+            and row["state"] == "device"
+        if row["usb_target"] and row["net_target"]:
+            row["tag"] = TAG_BOTH
+        elif row["net_target"]:
+            row["tag"] = TAG_WIFI
+        elif row["usb_target"]:
+            row["tag"] = TAG_USB
+        else:
+            # nothing live: a saved or advertised device is a wireless one
+            row["tag"] = TAG_WIFI
+        # Device operations prefer USB when both links are up; it is the
+        # faster and steadier of the two.
+        row["target"] = row["usb_target"] or row["net_target"]
+        # Reconnecting prefers a fresh mDNS advert over a stale cached port.
+        row["known_target"] = (row["mdns_target"] or row["cached_target"]
+                               or row["net_target"])
+        row["suspended"] = bool(row["serial"]) \
+            and row["serial"] in suspended and not row["online"]
+        row["label"] = resolve_label(
+            row["serial"],
+            row["live_model"] or row["cached_label"] or row["serial"]
+            or row["known_target"] or "?",
+            aliases)
+        out.append(row)
+    return out
+
+
+def view_signature(rows, lang):
+    """Stable fingerprint of what the menu shows, to avoid pointless rebuilds."""
+    return repr((lang, [(r["serial"], r["label"], r["state"], r["tag"],
+                         r["usb_target"], r["net_target"],
+                         r["known_target"], r["online"], r["suspended"],
+                         r["battery"]) for r in rows]))
 
 
 _dark_cache = {"value": None}
@@ -820,19 +1197,32 @@ def make_icon(color, label="", outline=None):
 
 
 def collect_state():
+    """One snapshot of the world, already de-duplicated. Runs off the GUI thread."""
     devices = list_devices()
-    batteries = {}
+    serial_by_target, batteries, sdk_by_target = {}, {}, {}
     for d in devices:
-        if d["state"] == "device":
-            b = device_battery(d["serial"])
-            if b is not None:
-                batteries[d["serial"]] = b
+        if d["state"] != "device":
+            continue
+        probe = probe_device(d["serial"])
+        if probe["serial"]:
+            serial_by_target[d["serial"]] = probe["serial"]
+        if probe["battery"] is not None:
+            batteries[d["serial"]] = probe["battery"]
+        if probe["sdk"] is not None:
+            sdk_by_target[d["serial"]] = probe["sdk"]
+    cached = cached_entries()
+    mdns = mdns_entries()
+    suspended = suspended_serials()
     return {
         "devices": devices,
-        "cached": cached_entries(),
-        "mdns": mdns_entries(),
-        "suspended": suspended_serials(),
+        "cached": cached,
+        "mdns": mdns,
+        "suspended": suspended,
         "batteries": batteries,
+        "sdks": sdk_by_target,
+        "serials": serial_by_target,
+        "view": merge_device_view(devices, serial_by_target, cached, mdns,
+                                 suspended, S.get("aliases"), batteries),
         "dark": system_is_dark(),
     }
 
@@ -840,8 +1230,8 @@ def collect_state():
 class SettingsDialog(QDialog):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(tr("الإعدادات — ADB Wireless", 
-                               "Settings — ADB Wireless"))
+        self.setWindowTitle(tr("الإعدادات - ADB Wireless",
+                               "Settings - ADB Wireless"))
         self.setMinimumWidth(420)
         form = QFormLayout(self)
 
@@ -938,7 +1328,7 @@ class PairDialog(QDialog):
         self.readiness.setTextFormat(Qt.RichText)
         lay.addWidget(self.readiness)
         row_r = QHBoxLayout()
-        btn_refresh = QPushButton(tr("🔄 تحديث الفحص", "🔄 Re-check"))
+        btn_refresh = QPushButton(tr("إعادة الفحص", "Re-check"))
         btn_refresh.clicked.connect(self.refresh_readiness)
         row_r.addStretch(1)
         row_r.addWidget(btn_refresh)
@@ -966,14 +1356,14 @@ class PairDialog(QDialog):
         hint2 = QLabel(tr(
             f"{tr('اسم الخدمة', 'Service')}: {self._scan_name}    "
             f"{tr('الرمز', 'Code')}: {self._scan_pwd}\n"
-            "على الهاتف: خيارات المطوّر ← تصحيح لاسلكي ← "
-            "«إقران الجهاز برمز QR» ثم امسح هذا الرمز.",
-            "On phone: Developer options → Wireless debugging → "
+            "على الهاتف: خيارات المطوّر > تصحيح لاسلكي > "
+            "'إقران الجهاز برمز QR' ثم امسح هذا الرمز.",
+            "On phone: Developer options > Wireless debugging > "
             "'Pair device with QR code' then scan this."))
         hint2.setWordWrap(True)
         sl.addWidget(hint2)
-        self.scan_status = QLabel(tr("⏳ بانتظار مسح الهاتف…",
-                                     "⏳ Waiting for phone to scan…"))
+        self.scan_status = QLabel(tr("بانتظار مسح الهاتف للرمز...",
+                                     "Waiting for the phone to scan..."))
         self.scan_status.setWordWrap(True)
         sl.addWidget(self.scan_status)
         tabs.addTab(scan_w, tr("مسح تلقائي", "Auto-scan"))
@@ -981,9 +1371,9 @@ class PairDialog(QDialog):
         code_w = QWidget()
         cl = QVBoxLayout(code_w)
         hint = QLabel(tr(
-            "على الهاتف: خيارات المطوّر ← تصحيح لاسلكي ← الإقران برمز.\n"
+            "على الهاتف: خيارات المطوّر > تصحيح لاسلكي > الإقران برمز.\n"
             "أدخل عنوان الاقتران والرمز الظاهر على شاشة الهاتف.",
-            "On phone: Developer options → Wireless debugging → Pair with "
+            "On phone: Developer options > Wireless debugging > Pair with "
             "code.\nEnter the pairing address and code shown on the phone."))
         hint.setWordWrap(True)
         cl.addWidget(hint)
@@ -991,7 +1381,7 @@ class PairDialog(QDialog):
         self.addr = QLineEdit()
         self.addr.setPlaceholderText(tr("العنوان مثل 192.168.1.5:37843",
                                         "Address e.g. 192.168.1.5:37843"))
-        btn_scan = QPushButton(tr("بحث 🔍", "Scan 🔍"))
+        btn_scan = QPushButton(tr("بحث", "Scan"))
         btn_scan.clicked.connect(self.scan)
         row1.addWidget(self.addr, 1)
         row1.addWidget(btn_scan)
@@ -1015,17 +1405,17 @@ class PairDialog(QDialog):
         qr_w = QWidget()
         ql = QVBoxLayout(qr_w)
         qhint = QLabel(tr(
-            "يولّد رمز QR يحمل بيانات الاقتران (اسم الخدمة + الرمز) — "
+            "يولّد رمز QR يحمل بيانات الاقتران (اسم الخدمة + الرمز) - "
             "احفظه أو امسحه بجهاز آخر لنقل الإعداد بسرعة.\n"
             "ملاحظة: مسح الهاتف لـ QR من الشاشة يتطلب Wi-Fi Aware "
             "وغير مدعوم عبر adb.",
             "Generates a QR carrying the pairing payload (service name + "
-            "code) — save it or scan with another device to transfer the "
+            "code) - save it or scan with another device to transfer the "
             "setup.\nNote: phone-scans-screen QR needs Wi-Fi Aware and is "
             "not available via adb."))
         qhint.setWordWrap(True)
         ql.addWidget(qhint)
-        self.qr_img = QLabel(tr("أدخل العنوان والرمز في تبويب «برمز» أولًا",
+        self.qr_img = QLabel(tr("أدخل العنوان والرمز في تبويب 'برمز' أولًا",
                                 "Fill address & code in the Code tab first"))
         self.qr_img.setAlignment(Qt.AlignCenter)
         self.qr_img.setMinimumHeight(180)
@@ -1033,7 +1423,7 @@ class PairDialog(QDialog):
         rowq = QHBoxLayout()
         btn_gen = QPushButton(tr("توليد / تحديث QR", "Generate / refresh QR"))
         btn_gen.clicked.connect(self.refresh_qr)
-        btn_save = QPushButton(tr("حفظ PNG…", "Save PNG…"))
+        btn_save = QPushButton(tr("حفظ PNG...", "Save PNG..."))
         btn_save.clicked.connect(self.save_qr)
         rowq.addWidget(btn_gen)
         rowq.addWidget(btn_save)
@@ -1067,20 +1457,20 @@ class PairDialog(QDialog):
             out = sh(["adb", "mdns", "services"], 6)
             addr = find_pairing_service(out, self._scan_name)
             if addr:
-                status = tr("تم العثور على الهاتف — جارٍ الاقتران…",
-                            "Phone found — pairing…")
+                status = tr("تم العثور على الهاتف - جارٍ الاقتران...",
+                            "Phone found - pairing...")
                 self.scan_status_safe(status)
                 pout = sh(["adb", "pair", addr, self._scan_pwd], 25)
                 if "Success" not in pout and "success" not in pout:
-                    self.scan_status_safe(tr("فشل الاقتران ✗ أعد المحاولة",
-                                             "Pairing failed ✗ retry"))
+                    self.scan_status_safe(tr("فشل الاقتران x أعد المحاولة",
+                                             "Pairing failed x retry"))
                     return
                 paired_addr = addr
                 break
             time.sleep(1)
         if paired_addr is None:
-            self.scan_status_safe(tr("انتهت المهلة — لم يتم مسح الرمز",
-                                     "Timed out — QR was not scanned"))
+            self.scan_status_safe(tr("انتهت المهلة - لم يتم مسح الرمز",
+                                     "Timed out - QR was not scanned"))
             return
         conn_addr = None
         deadline2 = time.time() + 30
@@ -1100,13 +1490,13 @@ class PairDialog(QDialog):
             model = sh(["adb", "-s", target, "shell",
                         "getprop ro.product.model"], 6).strip() or "?"
             save_cache_entry(serial, target, model.replace("_", " "))
-            notify(tr("تم الاقتران والاتصال ✓",
-                      "Paired && connected ✓"), target)
+            notify(tr("تم الاقتران والاتصال ",
+                      "Paired && connected "), target)
             self.kick_refresh()
             self.scan_done.emit()
             return
-        self.scan_status_safe(tr("اقترن لكن لم يتصل — جرّب زر إعادة الاتصال",
-                                 "Paired but connect failed — try reconnect"))
+        self.scan_status_safe(tr("اقترن لكن لم يتصل - جرّب زر إعادة الاتصال",
+                                 "Paired but connect failed - try reconnect"))
 
     def done(self, r):
         self._stop_scan = True
@@ -1132,9 +1522,9 @@ class PairDialog(QDialog):
         if dev_state == "device":
             w = get_wireless_debugging_enabled(usb[0]["serial"])
             wifi_dbg = {True: True, False: False}.get(w)
-        marks = {True: "<span style='color:#2ecc71'>✔</span>",
-                 False: "<span style='color:#e74c3c'>✘</span>",
-                 None: "<span style='color:#f39c12'>•</span>"}
+        marks = {True: "<span style='color:#2ecc71'>[ OK ]</span>",
+                 False: "<span style='color:#e74c3c'>[FAIL]</span>",
+                 None: "<span style='color:#f39c12'>[TODO]</span>"}
         lines = []
         for okk, ar, en in evaluate_readiness(dev_state, wifi_dbg):
             lang_en = S.get("lang") == "en"
@@ -1211,10 +1601,10 @@ class PairDialog(QDialog):
                 conn = mdns_targets()[:1]
                 if conn:
                     sh(["adb", "connect", conn[0]], 12)
-                notify(tr("تم الاقتران ✓", "Paired ✓"),
+                notify(tr("تم الاقتران ", "Paired "),
                        tr("يمكنك الاتصال الآن", "You can now connect"))
             else:
-                notify(tr("فشل الاقتران ✗", "Pairing failed ✗"),
+                notify(tr("فشل الاقتران x", "Pairing failed x"),
                        tr("تأكد من الرمز وأن النافذة مفتوحة",
                           "Check the code and keep the dialog open"))
             if _tray_ref is not None:
@@ -1230,7 +1620,7 @@ class DropZone(QWidget):
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint
                             | Qt.WindowStaysOnTopHint)
         self.setAcceptDrops(True)
-        lbl = QLabel("📦\n" + tr("أفلت APK هنا", "Drop APK here"))
+        lbl = QLabel(tr("أفلت ملفات APK هنا", "Drop APK files here"))
         lbl.setAlignment(Qt.AlignCenter)
         lbl.setStyleSheet(
             "background:#17202a;color:#ecf0f1;border:3px dashed #3498db;"
@@ -1242,7 +1632,7 @@ class DropZone(QWidget):
         self.setFixedSize(150, 150)
         from PyQt5.QtWidgets import QToolButton
         self.close_btn = QToolButton(self)
-        self.close_btn.setText("✕")
+        self.close_btn.setText("x")
         self.close_btn.setFixedSize(24, 24)
         self.close_btn.setStyleSheet(
             "QToolButton{border:none;background:#e74c3c;color:white;"
@@ -1313,10 +1703,8 @@ class Tray(QSystemTrayIcon):
         _tray_ref = self
         self.busy = False
         self.devices = []
-        self.cached = []
-        self.mdns = []
+        self.view = []          # merged, de-duplicated device rows
         self.suspended = set()
-        self.batteries = {}
         self._sig = None
         self.pending_rebuild = False
         self._prev_online = None
@@ -1353,36 +1741,36 @@ class Tray(QSystemTrayIcon):
         self.header = self.menu.addAction("")
         self.header.setEnabled(False)
         self.sep1 = self.menu.addSeparator()
-        act_recon = self.menu.addAction(tr("🔄  إعادة اتصال الكل",
-                                           "🔄  Reconnect all"))
+        act_recon = self.menu.addAction(tr("إعادة اتصال الكل",
+                                           "Reconnect all"))
         act_recon.triggered.connect(self.reconnect_all)
-        act_usb = self.menu.addAction(tr("🔌  توصيل جهاز عبر USB",
-                                         "🔌  Connect USB device"))
-        act_usb.triggered.connect(self.usb_connect_flow)
-        act_pair = self.menu.addAction(tr("🔗  اقتران لاسلكي (بدون كابل)",
-                                          "🔗  Wireless pairing (no cable)"))
+        act_usb = self.menu.addAction(tr("توصيل جهاز عبر USB",
+                                         "Connect a device over USB"))
+        act_usb.triggered.connect(lambda: self.usb_connect_flow())
+        act_pair = self.menu.addAction(tr("اقتران لاسلكي (بدون كابل)",
+                                          "Wireless pairing (no cable)"))
         act_pair.triggered.connect(lambda: PairDialog().exec_())
-        act_qr = self.menu.addAction(tr("📱  اتصال بـ QR (مسح تلقائي)",
-                                        "📱  QR connect (auto-scan)"))
+        act_qr = self.menu.addAction(tr("اقتران برمز QR (مسح تلقائي)",
+                                        "QR pairing (auto-scan)"))
         act_qr.triggered.connect(
             lambda: PairDialog(start_tab="scan").exec_())
-        act_apk = self.menu.addAction(tr("📦  تثبيت ملفات APK…",
-                                         "📦  Install APK files…"))
+        act_apk = self.menu.addAction(tr("تثبيت ملفات APK",
+                                         "Install APK files"))
         act_apk.triggered.connect(lambda: self.install_flow(None))
-        act_zone = self.menu.addAction(tr("📥  منطقة إفلات APK",
-                                          "📥  Toggle APK drop-zone"))
+        act_zone = self.menu.addAction(tr("منطقة إفلات APK",
+                                          "APK drop-zone"))
         act_zone.triggered.connect(self.toggle_dropzone)
-        act_disc = self.menu.addAction(tr("✂️  فصل الكل", "✂️  Disconnect all"))
+        act_disc = self.menu.addAction(tr("فصل الكل", "Disconnect all"))
         act_disc.triggered.connect(self.disconnect_all)
         self.sep2 = self.menu.addSeparator()
-        act_doc = self.menu.addAction(tr("🩺  فحص النظام", "🩺  Doctor"))
+        act_doc = self.menu.addAction(tr("فحص النظام", "Doctor"))
         act_doc.triggered.connect(self.doctor)
-        act_set = self.menu.addAction(tr("⚙️  الإعدادات", "⚙️  Settings"))
+        act_set = self.menu.addAction(tr("الإعدادات", "Settings"))
         act_set.triggered.connect(lambda: SettingsDialog().exec_())
-        act_log = self.menu.addAction(tr("📄  السجل", "📄  Open log"))
+        act_log = self.menu.addAction(tr("عرض السجل", "Open log"))
         act_log.triggered.connect(lambda: open_in_file_manager(LOG_FILE))
         self.menu.addSeparator()
-        act_quit = self.menu.addAction(tr("❌  إنهاء", "❌  Quit"))
+        act_quit = self.menu.addAction(tr("إنهاء", "Quit"))
         act_quit.triggered.connect(QApplication.quit)
 
     def ensure_dropzone(self):
@@ -1411,8 +1799,8 @@ class Tray(QSystemTrayIcon):
             paths = apk_paths
             if not paths:
                 notify(tr("ملفات غير مدعومة", "Unsupported files"),
-                       tr(f"تجاهُلت {len(rejected)} — المطلوب ملفات APK",
-                          f"skipped {len(rejected)} — APK files only"))
+                       tr(f"تجاهُلت {len(rejected)} - المطلوب ملفات APK",
+                          f"skipped {len(rejected)} - APK files only"))
                 return
         if not paths:
             paths, _ = QFileDialog.getOpenFileNames(
@@ -1420,9 +1808,13 @@ class Tray(QSystemTrayIcon):
                 os.path.expanduser("~"), "APK (*.apk)")
         if not paths:
             return
-        online = [d for d in self.devices if d["state"] == "device"]
+        # picker fed from the merged view, so a phone on USB and Wi-Fi at the
+        # same time is offered once, not twice
+        online = [{"serial": r["target"], "model": r["label"],
+                   "state": "device"}
+                  for r in self.view if r["online"]]
         if not online:
-            notify(tr("لا أجهزة", "No devices"),
+            notify(tr("لا توجد أجهزة", "No devices"),
                    tr("وصّل جهازًا أولًا", "Connect a device first"))
             return
         if len(online) == 1:
@@ -1430,9 +1822,7 @@ class Tray(QSystemTrayIcon):
             return
         menu = QMenu()
         for d in online:
-            menu.addAction(
-                f"📱 {resolve_label(d['serial'], d['model'], S.get('aliases'))}"
-            ).triggered.connect(
+            menu.addAction(d["model"]).triggered.connect(
                 lambda _, dd=d: self._do_install(paths, dd, rejected))
         menu.exec_(QCursor.pos())
 
@@ -1447,7 +1837,7 @@ class Tray(QSystemTrayIcon):
         queued = [False]
 
         # preflight: if the gate will queue us (another op is running),
-        # don't flash an orphan dialog — run_job notifies instead
+        # don't flash an orphan dialog - run_job notifies instead
         if self.busy and self._busy_owner is not None \
                 and time.time() < self._busy_deadline:
             queued[0] = True
@@ -1488,15 +1878,15 @@ class Tray(QSystemTrayIcon):
                 out = tmpo.read()
                 tmpo.close()
             if timed_out:
-                return False, tr("انتهت المهلة — الاتصال بطيء أو مقطوع",
-                                 "timed out — connection slow or broken")
+                return False, tr("انتهت المهلة - الاتصال بطيء أو مقطوع",
+                                 "timed out - connection slow or broken")
             reason = friendly_adb_error(out)
             return (not reason), reason
 
         def job():
             try:
                 if queued[0]:
-                    # worker thread — must reach show() via a queued signal
+                    # worker thread - must reach show() via a queued signal
                     dlg.show_requested.emit()
                 results = []  # (name, ok, reason)
                 for i, p in enumerate(paths, 1):
@@ -1546,7 +1936,7 @@ class Tray(QSystemTrayIcon):
             with open(path, "wb") as f:
                 f.write(r.stdout or b"")
             self.op_done.emit(tr("لقطة شاشة", "Screenshot"),
-                              f"{model} → {path}")
+                              f"{model} > {path}")
         self.run_job(job)
 
     def record_screen(self, target, model):
@@ -1564,8 +1954,8 @@ class Tray(QSystemTrayIcon):
                 capture_output=True, timeout=60)
             sh(["adb", "-s", target, "shell", f"rm -f {remote}"], 8)
             self.op_done.emit(tr("تسجيل شاشة", "Screen recording"),
-                              f"{model} → {local}")
-        notify(tr("تسجيل بدأ ⏺", "Recording started ⏺"),
+                              f"{model} > {local}")
+        notify(tr("بدأ التسجيل", "Recording started"),
                tr(f"مدة {RECORD_SECONDS} ثانية", f"{RECORD_SECONDS}s"))
         self.run_job(job)
 
@@ -1612,7 +2002,7 @@ class Tray(QSystemTrayIcon):
                     if tag and version_is_newer(tag.lstrip("v"),
                                                 __version__):
                         notify(
-                            tr("يتوفر تحديث جديد 🚀", "Update available 🚀"),
+                            tr("يتوفر تحديث جديد", "Update available"),
                             tr(f"الإصدار {tag} متاح على GitHub",
                                f"Version {tag} is on GitHub"))
                         break
@@ -1641,26 +2031,21 @@ class Tray(QSystemTrayIcon):
             self.pending_rebuild = True
             return
         self.devices = state["devices"]
-        self.cached = state["cached"]
-        self.mdns = state["mdns"]
-        self.suspended = {s.upper() for s in state["suspended"]}
-        self.batteries = state["batteries"]
+        self.suspended = {norm_serial(s) for s in state["suspended"]}
+        self.view = state["view"]
 
-        online = [d for d in self.devices if d["state"] == "device"]
-        wireless = [d for d in online if not d["usb"]]
-        aliases = S.get("aliases")
+        online = [r for r in self.view if r["online"]]
+        wireless = [r for r in online if r["net_target"]]
 
         if not shutil.which("adb"):
             self.setIcon(make_icon(C_GRAY, "!"))
-            self.setToolTip(tr("adb غير مثبت!", "adb not found!"))
+            self.setToolTip(tr("adb غير مثبت", "adb is not installed"))
         elif online:
             self.setIcon(make_icon(C_GREEN, str(len(online))))
             tip = "\n".join(
-                f"{resolve_label(d['serial'], d['model'], aliases)} — "
-                f"{d['serial']}" +
-                (f" 🔋{self.batteries[d['serial']]}%"
-                 if d["serial"] in self.batteries else "")
-                for d in online)
+                f"{r['label']} - {r['target']}" +
+                (f"  {r['battery']}%" if r["battery"] is not None else "")
+                for r in online)
             self.setToolTip(
                 tr(f"متصل ({len(wireless)} لاسلكي):\n{tip}",
                    f"Connected ({len(wireless)} wireless):\n{tip}"))
@@ -1668,30 +2053,23 @@ class Tray(QSystemTrayIcon):
             self.setIcon(make_icon(C_RED, "0"))
             self.setToolTip(tr("لا توجد أجهزة متصلة", "No devices connected"))
 
-        cur_online = {d["serial"] for d in wireless}
+        # Loss detection keys on the hardware serial, not on the transport
+        # name: a phone whose wireless port rotates keeps the same serial and
+        # must not be reported as disconnected.
+        cur_online = {r["serial"] for r in wireless if r["serial"]}
         if self._prev_online is not None:
-            lost = self._prev_online - cur_online
-            if lost:
-                models = {d["serial"]: resolve_label(
-                    d["serial"], d["model"], aliases)
-                    for d in self.devices}
-                targets_by_serial = {s: t for s, t, _ in self.cached}
-                for s in lost:
-                    threading.Thread(
-                        target=self._loss_handler, daemon=True,
-                        args=(s, models.get(s, s),
-                              targets_by_serial.get(s))).start()
+            by_serial = {r["serial"]: r for r in self.view if r["serial"]}
+            for s in self._prev_online - cur_online:
+                row = by_serial.get(s)
+                if row is not None and row["suspended"]:
+                    continue           # the user asked for this one to stay off
+                threading.Thread(
+                    target=self._loss_handler, daemon=True,
+                    args=(s, row["label"] if row else s,
+                          row["known_target"] if row else "")).start()
         self._prev_online = cur_online
 
-        sig = repr((
-            sorted((d["serial"], d["state"]) for d in self.devices),
-            sorted((s, t) for s, t, _ in self.cached),
-            sorted(self.mdns),
-            sorted(self.suspended),
-            sorted(self.batteries.items()),
-            sorted((k, v) for k, v in (S.get("aliases") or {}).items()),
-            S.get("lang"),
-        ))
+        sig = view_signature(self.view, S.get("lang"))
         if sig == self._sig:
             return
         self._sig = sig
@@ -1702,87 +2080,91 @@ class Tray(QSystemTrayIcon):
 
     def _loss_handler(self, serial, model, target):
         choice = actionable_notify(
-            tr(f"انقطع اتصال {model} ⚠️", f"{model} disconnected ⚠️"),
+            tr(f"انقطع اتصال {model}", f"{model} disconnected"),
             tr("هل تريد إعادة الاتصال؟", "Reconnect now?"),
-            {"reconnect": tr("أعد الاتصال", "Reconnect"),
+            {"reconnect": tr("إعادة الاتصال", "Reconnect"),
              "dismiss": tr("تجاهل", "Dismiss")})
         if choice == "reconnect" and target:
             self.reconnect_one(target, serial)
 
     def rebuild_device_items(self):
+        """One menu entry per physical device, taken from the merged view."""
         for a in self.device_actions:
             self.menu.removeAction(a)
         self.device_actions = []
 
-        aliases = S.get("aliases")
-        online = [d for d in self.devices if d["state"] == "device"]
-        bad = [d for d in self.devices if d["state"] != "device"]
-        connected = {d["serial"] for d in self.devices}
-        offline = [(s, t, lbl) for s, t, lbl in self.cached
-                   if t not in connected]
-        for mserial, t in self.mdns:
-            if t not in connected and t not in {x for _, x, _ in offline}:
-                offline.append((mserial, t, "mDNS"))
+        aliases = S.get("aliases") or {}
+        rows = self.view
+        online, unready, offline = [], [], []
+        for r in rows:
+            if r["online"]:
+                online.append(r)
+            elif r["state"] in ("unauthorized", "offline"):
+                unready.append(r)
+            else:
+                offline.append(r)
 
-        self.header.setText(tr("الأجهزة المتصلة", "Connected Devices"))
+        self.header.setText(tr("الأجهزة", "Devices"))
 
-        if not online and not bad and not offline:
+        if not rows:
             a = self.menu.addAction(tr("لا توجد أجهزة", "No devices"))
             a.setEnabled(False)
             self._add(a)
 
-        for d in online:
-            tag = "USB" if d["usb"] else "WiFi"
-            bat = self.batteries.get(d["serial"])
-            battxt = f" 🔋{bat}%" if bat is not None else ""
-            sub = QMenu(f"📱 {resolve_label(d['serial'], d['model'], aliases)}"
-                        f"{battxt}  [{tag}]", self.menu)
+        for r in online:
+            bat = f"  {r['battery']}%" if r["battery"] is not None else ""
+            sub = QMenu(f"{r['label']}{bat}  [{r['tag']}]", self.menu)
             a = self.menu.addMenu(sub)
-            sub.addAction(tr("🖥️  عرض الشاشة (scrcpy)",
-                             "🖥️  Mirror screen")).triggered.connect(
-                lambda _, t=d["serial"]: self.run_scrcpy(t))
-            sub.addAction(tr("📸  لقطة شاشة", "📸  Screenshot"))\
+            target, label = r["target"], r["label"]
+            sub.addAction(tr("عرض الشاشة (scrcpy)", "Mirror screen (scrcpy)"))\
+                .triggered.connect(lambda _, t=target: self.run_scrcpy(t))
+            sub.addAction(tr("لقطة شاشة", "Screenshot")).triggered.connect(
+                lambda _, t=target, m=label: self.screenshot(t, m))
+            sub.addAction(tr(f"تسجيل شاشة ({RECORD_SECONDS} ثانية)",
+                             f"Record screen ({RECORD_SECONDS}s)"))\
                 .triggered.connect(
-                lambda _, t=d["serial"], m=d["model"]: self.screenshot(t, m))
-            sub.addAction(tr("⏺️  تسجيل شاشة (30ث)",
-                             "⏺️  Record screen (30s)")).triggered.connect(
-                lambda _, t=d["serial"], m=d["model"]:
-                    self.record_screen(t, m))
-            sub.addAction(tr("ℹ️  معلومات الجهاز", "ℹ️  Device info"))\
+                lambda _, t=target, m=label: self.record_screen(t, m))
+            sub.addAction(tr("معلومات الجهاز", "Device info"))\
                 .triggered.connect(
-                lambda _, t=d["serial"], m=d["model"]: self.show_info_safe(
-                    t, m))
-            sub.addAction(tr("✏️  تسمية", "✏️  Rename")).triggered.connect(
-                lambda _, s=d["serial"]:
+                lambda _, t=target, m=label: self.show_info_safe(t, m))
+            sub.addAction(tr("تسمية", "Rename")).triggered.connect(
+                lambda _, s=r["serial"] or target:
                     self.rename_device(s, aliases.get(s, "")))
-            sub.addAction(tr("✂️  فصل مؤقت", "✂️  Disconnect"))\
-                .triggered.connect(lambda _, t=d["serial"]: self.drop_one(t))
+            if not r["net_target"] and r["usb_target"]:
+                sub.addAction(tr("تحويل إلى اتصال لاسلكي",
+                                 "Switch to wireless"))\
+                    .triggered.connect(
+                        lambda _, s=r["usb_target"]: self.usb_connect_flow(s))
+            if r["net_target"]:
+                sub.addAction(tr("فصل مؤقت", "Disconnect"))\
+                    .triggered.connect(
+                        lambda _, t=r["net_target"], s=r["serial"]:
+                            self.drop_one(t, s))
             self._add(a)
 
-        for sserial, t, lbl in offline:
-            if sserial.upper() in self.suspended:
-                sub = QMenu(f"🚫 {lbl} — "
-                            f"{tr('موقوف بواسطتك', 'paused by you')} ({t})",
-                            self.menu)
-            else:
-                sub = QMenu(f"📴 {lbl} — "
-                            f"{tr('غير متصل', 'offline')} ({t})", self.menu)
+        for r in offline:
+            target = r["known_target"]
+            state_txt = tr("موقوف بواسطتك", "paused by you") if r["suspended"] \
+                else tr("غير متصل", "offline")
+            sub = QMenu(f"{r['label']} - {state_txt} ({target})", self.menu)
             a = self.menu.addMenu(sub)
-            sub.addAction(tr("🔄  إعادة الاتصال الآن", "🔄  Reconnect now"))\
-                .triggered.connect(lambda _, tt=t, ss=sserial:
-                                   self.reconnect_one(tt, ss))
-            sub.addAction(tr("🗑️  حذف من المحفوظات", "🗑️  Forget device"))\
-                .triggered.connect(lambda _, tt=t: self.remove_saved(tt))
+            sub.addAction(tr("إعادة الاتصال الآن", "Reconnect now"))\
+                .triggered.connect(
+                    lambda _, tt=target, ss=r["serial"]:
+                        self.reconnect_one(tt, ss))
+            sub.addAction(tr("حذف من المحفوظات", "Forget device"))\
+                .triggered.connect(lambda _, tt=target: self.remove_saved(tt))
             self._add(a)
 
-        for d in bad:
-            state_ar = {
-                "unauthorized": tr("غير مصرّح — اقبل النافذة على الهاتف",
-                                   "unauthorized — accept prompt on phone"),
-                "offline": tr("غير متصل", "offline"),
-            }.get(d["state"], d["state"])
-            a = self.menu.addAction(
-                f"⚠️ {d['model']} — {state_ar} ({d['state']})")
+        for r in unready:
+            explain = {
+                "unauthorized": tr("غير مصرّح - اقبل النافذة على الهاتف",
+                                   "unauthorized - accept the prompt on the "
+                                   "phone"),
+                "offline": tr("الاتصال معلّق - أعد التوصيل",
+                              "transport offline - reconnect it"),
+            }.get(r["state"], r["state"])
+            a = self.menu.addAction(f"{r['label']} - {explain}")
             a.setEnabled(False)
             self._add(a)
 
@@ -1803,9 +2185,9 @@ class Tray(QSystemTrayIcon):
                 f"{tr('الموديل', 'Model')}: {info['model']}\n"
                 f"{tr('الأندرويد', 'Android')}: {info['android']}\n"
                 f"{tr('التسلسلي', 'Serial')}: {info['serial']}\n"
-                f"🔋 {tr('البطارية', 'Battery')}: {bat}\n"
-                f"💾 {tr('التخزين', 'Storage')}: {storage}\n"
-                f"🌐 IP: {', '.join(info['ips']) or '?'}\n"
+                f"{tr('البطارية', 'Battery')}: {bat}\n"
+                f"{tr('التخزين', 'Storage')}: {storage}\n"
+                f"IP: {', '.join(info['ips']) or '?'}\n"
                 f"{tr('الاتصال', 'Connection')}: {target}")
             self.info_ready.emit(text)
         self.run_job(job)
@@ -1818,7 +2200,7 @@ class Tray(QSystemTrayIcon):
         self.busy = busy
         self._busy_deadline = time.time() + timeout if busy else 0.0
         if busy:
-            self.setIcon(make_icon(C_YELLOW, "…"))
+            self.setIcon(make_icon(C_YELLOW, "..."))
             self.setToolTip(hint or tr("جارٍ العمل...",
                                        "Working..."))
 
@@ -1866,144 +2248,188 @@ class Tray(QSystemTrayIcon):
                 and time.time() > self._busy_deadline:
             self.on_busy_release(self._busy_owner)
 
+    def _attach(self, target, serial="", label=""):
+        """Connect one target, verify it, and record the result.
+
+        Shared by every reconnect path so verification and cache bookkeeping
+        can never drift apart. Returns (ok, target, detail).
+        """
+        want = norm_serial(serial)
+        candidates = []
+        fresh = mdns_target_for_serial(mdns_entries(), want) if want else ""
+        # A fresh mDNS advert beats a saved port: Android rotates the
+        # wireless-debugging port on every reboot and Wi-Fi toggle.
+        for t in (fresh, target):
+            if t and t not in candidates:
+                candidates.append(t)
+        if not candidates:
+            return False, target, tr("لا يوجد عنوان معروف لهذا الجهاز",
+                                     "no known address for this device")
+        last = ""
+        for t in candidates:
+            ok, got, reason = connect_and_verify(t, want)
+            if ok:
+                found = got or want or device_serial(t)
+                suspend_del(found)
+                save_cache_entry(found, t, label or self._label_for(t, found))
+                return True, t, ""
+            last = reason
+        return False, candidates[0], last
+
+    def _label_for(self, target, serial=""):
+        for r in self.view:
+            if target in (r["usb_target"], r["net_target"],
+                          r["known_target"]) \
+                    or (serial and r["serial"] == norm_serial(serial)):
+                return r["label"]
+        probe = probe_device(target, 6)
+        return probe["model"] or serial or target
+
     def reconnect_all(self):
         def job():
-            connected_now = {d["serial"] for d in list_devices()
-                             if d["state"] == "device"}
-            targets = [(s, t, lbl) for s, t, lbl in cached_entries()]
-            known = {t for _, t, _ in targets}
-            for mserial, t in mdns_entries():
-                if t not in known:
-                    targets.append((mserial, t, "mDNS"))
+            rows = [r for r in self.view if not r["online"]
+                    and r["known_target"]]
+            if not rows:
+                self.op_done.emit(
+                    tr("إعادة الاتصال", "Reconnect"),
+                    tr("كل الأجهزة المعروفة متصلة بالفعل",
+                       "every known device is already connected")
+                    if self.view else
+                    tr("لا توجد أجهزة محفوظة. وصّل الجهاز بـ USB أولًا.",
+                       "No saved devices. Connect one over USB first."))
+                return
             ok, fail = [], []
-            for serial, t, label in targets:
-                if t in connected_now:
-                    ok.append(label)
-                    suspend_del(serial)
-                    continue
-                good = False
-                retries = max(1, int(S.get("max_retries")))
-                for _ in range(retries):
-                    sh(["adb", "connect", t], 10)
-                    time.sleep(1)
-                    if t in {d["serial"] for d in list_devices()
-                             if d["state"] == "device"}:
-                        good = True
-                        break
+            for r in rows:
+                good, target, reason = self._attach(
+                    r["known_target"], r["serial"], r["label"])
                 if good:
-                    suspend_del(serial)
-                    save_cache_entry(serial or device_serial(t), t, label)
-                    ok.append(f"{label} ({t})")
+                    ok.append(f"{r['label']} ({target})")
                 else:
-                    fail.append(f"{label} ({t})")
+                    fail.append(f"{r['label']}: {reason}")
             msg = ""
             if ok:
                 msg += tr("تم الاتصال: ", "Connected: ") + "، ".join(ok)
             if fail:
                 msg += ("\n" if msg else "") + \
-                    tr("فشل: ", "Failed: ") + "، ".join(fail)
-            if not msg:
-                msg = tr("لا توجد أجهزة محفوظة. وصّل الجهاز بـ USB أولًا.",
-                         "No saved devices. Plug one via USB first.")
+                    tr("فشل: ", "Failed: ") + "\n".join(fail)
             self.op_done.emit(tr("إعادة الاتصال", "Reconnect"), msg)
-        self.run_job(job, blocking=True, timeout=90,
+        self.run_job(job, blocking=True, timeout=150,
                      hint=tr("جارٍ إعادة الاتصال...", "Reconnecting..."))
 
-    def usb_connect_flow(self):
+    def usb_connect_flow(self, only_serial=""):
+        """Take USB-attached phones wireless without switching their
+        Wireless-debugging toggle off."""
         def job():
             devs = [d for d in list_devices()
-                    if d["usb"] and d["state"] == "device"]
+                    if d["usb"] and d["state"] == "device"
+                    and (not only_serial or d["serial"] == only_serial)]
             if not devs:
                 self.op_done.emit(
                     "USB", tr("لا يوجد جهاز موصول بـ USB (أو التخويل مرفوض)",
-                              "No USB device attached (or unauthorized)"))
+                              "No USB device attached (or not authorised)"))
                 return
-            port = next_free_port()
             results = []
             for d in devs:
-                serial = d["serial"]
-                sh(["adb", "-s", serial, "tcpip", str(port)], 12)
-                time.sleep(3)
-                done = False
-                for ip in phone_ips(serial):
-                    tgt = f"{ip}:{port}"
-                    sh(["adb", "connect", tgt], 10)
-                    states = {x["serial"]: x["state"] for x in list_devices()}
-                    if states.get(tgt) == "device":
-                        save_cache_entry(serial, tgt, d["model"])
-                        results.append(f"{d['model']} → {tgt}")
-                        done = True
-                        break
-                if not done:
-                    results.append(f"{d['model']} → {tr('فشل', 'failed')}")
-            self.op_done.emit(tr("توصيل USB", "USB connect"),
+                results.append(self._usb_to_wireless(d))
+            self.op_done.emit(tr("توصيل عبر USB", "USB connect"),
                               "\n".join(results))
-        self.run_job(job, blocking=True, timeout=60,
-                     hint=tr("جارٍ توصيل الجهاز عبر USB...",
-                             "Connecting via USB..."))
+        self.run_job(job, blocking=True, timeout=180,
+                     hint=tr("جارٍ التحويل إلى اتصال لاسلكي...",
+                             "Switching to wireless..."))
+
+    def _usb_to_wireless(self, dev):
+        """Strategy-driven wireless handover for a single USB device."""
+        serial = dev["serial"]
+        probe = probe_device(serial)
+        ident = probe["serial"] or norm_serial(serial)
+        label = probe["model"] or dev["model"]
+        strategy, target = plan_connect_strategy(
+            probe["sdk"], probe["adb_wifi"],
+            mdns_target_for_serial(mdns_entries(), ident))
+
+        if strategy == STRATEGY_ENABLE_WIFI:
+            enable_wireless_debugging(serial)
+            target = wait_for_mdns_target(ident)
+            strategy = STRATEGY_MDNS if target else STRATEGY_TCPIP
+        elif strategy == STRATEGY_AWAIT_MDNS:
+            target = wait_for_mdns_target(ident)
+            strategy = STRATEGY_MDNS if target else STRATEGY_TCPIP
+
+        if strategy == STRATEGY_MDNS:
+            ok, used, _ = self._attach(target, ident, label)
+            if ok:
+                return tr(f"{label}: متصل لاسلكيًا عبر {used}",
+                          f"{label}: wireless via {used}")
+            # The advert exists but the link failed; fall through to the
+            # legacy path rather than leaving the user stranded.
+
+        return self._legacy_tcpip_handover(serial, ident, label,
+                                          probe["adb_wifi"])
+
+    def _legacy_tcpip_handover(self, serial, ident, label, wifi_was_on):
+        """Last-resort path: `adb tcpip` restarts adbd on the phone.
+
+        That restart is what switches Wireless debugging off on Android 11+,
+        so the toggle is put back afterwards and the user is told what
+        happened.
+        """
+        port = next_free_port()
+        sh(["adb", "-s", serial, "tcpip", str(port)], 12)
+        time.sleep(3)
+        detail = ""
+        for ip in phone_ips(serial):
+            ok, used, reason = self._attach(f"{ip}:{port}", ident, label)
+            if ok:
+                if wifi_was_on:
+                    enable_wireless_debugging(serial)
+                return tr(f"{label}: متصل عبر {used} (منفذ ثابت)",
+                          f"{label}: connected via {used} (fixed port)")
+            detail = reason
+        if wifi_was_on:
+            enable_wireless_debugging(serial)
+        return tr(f"{label}: فشل - {detail or 'لا يوجد عنوان IP على الواي فاي'}",
+                  f"{label}: failed - {detail or 'no Wi-Fi address found'}")
 
     def disconnect_all(self):
+        """Drop wireless links on the host side only; the phone keeps its
+        Wireless-debugging toggle exactly as the user left it."""
         def job():
-            for d in list_devices():
-                if d["state"] == "device" and not d["usb"]:
-                    suspend_add(device_serial(d["serial"]))
+            dropped = 0
+            for r in self.view:
+                if r["online"] and r["net_target"]:
+                    suspend_add(r["serial"] or device_serial(r["net_target"]))
+                    dropped += 1
             sh(["adb", "disconnect"], 8)
             self.op_done.emit(
                 tr("فصل الاتصالات", "Disconnect all"),
-                tr("لن يعودوا تلقائيًا حتى تعيدوا من القائمة",
-                   "They stay offline until you reconnect them here"))
+                tr(f"تم فصل {dropped} - لن تعود تلقائيًا حتى تعيدها من القائمة",
+                   f"{dropped} disconnected - they stay offline until you "
+                   f"reconnect them here"))
         self.run_job(job)
 
-    def drop_one(self, target):
+    def drop_one(self, target, serial=""):
         def job():
-            serial = device_serial(target)
-            suspend_add(serial)
+            ident = norm_serial(serial) or device_serial(target)
+            label = self._label_for(target, ident)
+            suspend_add(ident)
             sh(["adb", "disconnect", target], 8)
-            name = next((resolve_label(d["serial"], d["model"],
-                                       S.get("aliases"))
-                         for d in list_devices() if d["serial"] == target),
-                        target)
             notify(tr("فصل مؤقت", "Disconnected"),
-                   tr(f"{name} لن يعود تلقائيًا — أعده من القائمة 🚫",
-                      f"{name} stays offline until you reconnect 🚫"))
+                   tr(f"{label} لن يعود تلقائيًا - أعده من القائمة",
+                      f"{label} stays offline until you reconnect it here"))
             self.kick_refresh()
         self.run_job(job)
 
     def reconnect_one(self, target, serial=""):
         def job():
-            dev_serial = serial or device_serial(target)
-            suspend_del(dev_serial)
-            final_target = target
-            online = lambda: {d["serial"] for d in list_devices()
-                              if d["state"] == "device"}
-            good = False
-            for i in range(2):
-                sh(["adb", "connect", final_target], 6)
-                time.sleep(1)
-                if final_target in online():
-                    good = True
-                    break
-            if not good and dev_serial:
-                t = mdns_target_for_serial(mdns_entries(), dev_serial)
-                if t:
-                    sh(["adb", "connect", t], 8)
-                    time.sleep(1)
-                    if t in online():
-                        good = True
-                        final_target = t
-            if good:
-                suspend_del(dev_serial)
-                model = next((d["model"] for d in list_devices()
-                              if d["serial"] == final_target), final_target)
-                save_cache_entry(dev_serial or device_serial(final_target),
-                                 final_target, model)
-                self.op_done.emit(tr("إعادة الاتصال", "Reconnect"),
-                                  f"{tr('تم', 'Done')}: {final_target}")
+            ident = norm_serial(serial) or device_serial(target)
+            suspend_del(ident)
+            ok, used, reason = self._attach(target, ident)
+            title = tr("إعادة الاتصال", "Reconnect")
+            if ok:
+                self.op_done.emit(title, tr(f"تم: {used}", f"Done: {used}"))
             else:
-                self.op_done.emit(
-                    tr("إعادة الاتصال", "Reconnect"),
-                    tr(f"فشل {final_target} — تأكد أن الهاتف والشبكة يعملان",
-                       f"Failed {final_target} — check phone & network"))
+                self.op_done.emit(title, tr(f"فشل {used} - {reason}",
+                                            f"Failed {used} - {reason}"))
         self.run_job(job, blocking=False)
 
     def remove_saved(self, target):
@@ -2016,35 +2442,44 @@ class Tray(QSystemTrayIcon):
         def job():
             if launch_scrcpy(target, str(S.get("scrcpy_args") or "")):
                 self.op_done.emit("scrcpy",
-                                  tr("جارٍ عرض الشاشة…", "Mirroring…"))
+                                  tr("جارٍ عرض الشاشة...", "Mirroring..."))
         self.run_job(job)
 
     def doctor(self):
         adb_v = sh(["adb", "version"], 6).splitlines()
-        adb_line = adb_v[0] if adb_v else "NOT FOUND!"
+        adb_line = adb_v[0] if adb_v else tr("غير مثبت", "not installed")
         adb_path = shutil.which("adb") or "-"
-        scrcpy_path = shutil.which("scrcpy") or tr("غير مثبت", "missing")
-        mdns = sh(["adb", "mdns", "check"], 8).strip() or "unsupported"
-        n_cache = len(cached_entries())
-        n_dev = len([d for d in self.devices if d["state"] == "device"])
-        watch_line = ""
+        scrcpy_path = shutil.which("scrcpy") or tr("غير مثبت", "not installed")
+        mdns_raw = sh(["adb", "mdns", "check"], 8).strip()
+        mdns_ok = "mdns daemon version" in mdns_raw.lower()
+        mdns = mdns_raw or tr("غير مدعوم", "unsupported")
+        online = [r for r in self.view if r["online"]]
+        lines = [
+            f"{tr('النسخة', 'Version')} : v{__version__}",
+            f"adb : {adb_line} [{adb_path}]",
+            f"scrcpy : {scrcpy_path}",
+            f"mDNS : {mdns}",
+        ]
+        if not mdns_ok:
+            lines.append(
+                tr("  تنبيه: بدون mDNS لن يعمل الاكتشاف التلقائي ولا اقتران "
+                   "QR، وسيضطر البرنامج لاستخدام tcpip",
+                   "  Note: without mDNS there is no auto-discovery or QR "
+                   "pairing, and the tool must fall back to tcpip"))
+        lines.append(f"{tr('شبكة الحاسب', 'This machine')} : {lan_info()}")
         if not IS_WINDOWS and not IS_MACOS and shutil.which("systemctl"):
             watch = sh(["systemctl", "--user", "is-active",
                         "adbwatch.service"], 6).strip()
-            state = tr("يعمل ✓", "running ✓") if watch == "active" \
-                else watch
-            watch_line = (f"{tr('المراقبة', 'Watch')} : {state}\n")
-        text = (
-            f"ADB : {adb_line} [{adb_path}]\n"
-            f"scrcpy : {scrcpy_path}\n"
-            f"mDNS : {mdns}\n"
-            f"{tr('شبكة الحاسب', 'This machine')} : {lan_info()}\n"
-            f"{watch_line}"
-            f"{tr('الأجهزة المتصلة', 'Devices')} : {n_dev}\n"
-            f"{tr('المحفوظة', 'Saved')} : {n_cache}\n"
-            f"{tr('النسخة', 'Version')} : v{__version__}")
-        QMessageBox.information(None,
-                                tr("فحص النظام", "Doctor"), text)
+            lines.append(
+                f"{tr('خدمة المراقبة', 'Watch service')} : "
+                f"{tr('تعمل', 'running') if watch == 'active' else watch}")
+        lines.append(f"{tr('أجهزة معروفة', 'Known devices')} : "
+                     f"{len(self.view)}")
+        lines.append(f"{tr('متصلة الآن', 'Connected now')} : {len(online)}")
+        for r in online:
+            lines.append(f"  {r['label']} [{r['tag']}] {r['target']}")
+        QMessageBox.information(None, tr("فحص النظام", "Doctor"),
+                                "\n".join(lines))
 
     def on_op_done(self, title, msg):
         notify(title, msg)
@@ -2110,7 +2545,7 @@ def main():
     state = {"tray": None, "tries": 0, "warned": False}
 
     def start_tray():
-        log(f"system tray ready after {state['tries']} wait cycle(s) — starting")
+        log(f"system tray ready after {state['tries']} wait cycle(s) - starting")
         tray = Tray()
         tray.show()
         state["tray"] = tray
@@ -2118,8 +2553,8 @@ def main():
         if S.get("show_dropzone"):
             QTimer_single(500, tray.ensure_dropzone)
         notify("ADB Wireless Manager v" + __version__,
-               tr("يعمل الآن — انقر الأيقونة للقائمة",
-                  "Running — click the icon for the menu"))
+               tr("يعمل الآن - انقر الأيقونة للقائمة",
+                  "Running - click the icon for the menu"))
 
     def wait_for_tray():
         if state["tray"] is not None:
@@ -2130,18 +2565,18 @@ def main():
             return
         if not state["warned"] and state["tries"] >= TRAY_WARN_AFTER_TRIES:
             state["warned"] = True
-            log("tray still unavailable — notifying user, keep polling")
+            log("tray still unavailable - notifying user, keep polling")
             notify("ADB Wireless Manager",
-                   tr("شريط النظام غير متاح بعد — سأواصل المحاولة.",
-                      "System tray is not available yet — still trying."))
+                   tr("شريط النظام غير متاح بعد - سأواصل المحاولة.",
+                      "System tray is not available yet - still trying."))
         QTimer_single(TRAY_WAIT_INTERVAL_MS, wait_for_tray)
 
     # At login the desktop shell may not have published its tray yet
-    # (AppIndicator / StatusNotifier DBus service) — poll instead of dying.
+    # (AppIndicator / StatusNotifier DBus service) - poll instead of dying.
     if QSystemTrayIcon.isSystemTrayAvailable():
         start_tray()
     else:
-        log("tray not ready at startup — polling every "
+        log("tray not ready at startup - polling every "
             f"{TRAY_WAIT_INTERVAL_MS // 1000} s")
         QTimer_single(TRAY_WAIT_INTERVAL_MS, wait_for_tray)
     return app.exec_()

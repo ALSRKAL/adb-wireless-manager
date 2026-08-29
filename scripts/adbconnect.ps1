@@ -1,6 +1,9 @@
 # ==============================================================================
-#  ADB Wireless Manager - Windows CLI  v12.0
+#  ADB Wireless Manager - Windows CLI  v14.0.0
 #  connect / reconnect / list / disconnect / pair / watch / doctor
+#  Prefers Android 11+ wireless debugging over mDNS; the classic 'adb tcpip'
+#  path is a fallback only, because it restarts adbd and switches the phone's
+#  Wireless-debugging toggle off.
 #  Requires: adb (platform-tools). Optional: scrcpy.
 #  Repo    : https://github.com/ALSRKAL/adb-wireless-manager
 # ==============================================================================
@@ -77,17 +80,22 @@ function Get-CachedTargets {
 
 function Add-CacheEntry([string]$Serial, [string]$Ip, [int]$P,
                         [string]$Label) {
+    # One row per device. Dropping rows that share the serial (case
+    # insensitive) or the address stops a phone whose wireless port rotated
+    # from being saved twice.
     New-Item -ItemType Directory -Force -Path $script:DataDir | Out-Null
+    $key = $Serial.ToUpper()
     $kept = @()
     if (Test-Path $script:CacheFile) {
         foreach ($line in Get-Content $script:CacheFile) {
             $c = $line -split "`t"
-            if ($c.Count -ge 4 -and "$($c[1]):$($c[2])" -ne "$Ip`:$P") {
-                $kept += $line
-            }
+            if ($c.Count -lt 4) { continue }
+            if ($key -and $c[0].ToUpper() -eq $key) { continue }
+            if ($c[1] -eq $Ip) { continue }
+            $kept += $line
         }
     }
-    $kept += "$Serial`t$Ip`t$P`t$Label`t$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+    $kept += "$key`t$Ip`t$P`t$Label`t$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
     Set-Content -Path $script:CacheFile -Value $kept -Encoding UTF8
 }
 
@@ -154,15 +162,74 @@ function Test-TargetConnected([string]$Target) {
     return [bool]$hit
 }
 
-function Connect-Target([string]$Target, [int]$Attempts = 3) {
+function Get-TargetSerial([string]$Target) {
+    $out = adb -s $Target shell getprop ro.serialno 2>$null
+    return ("$out").Trim().ToUpper()
+}
+
+function Get-DeviceSdk([string]$Target) {
+    $out = adb -s $Target shell getprop ro.build.version.sdk 2>$null
+    $digits = ("$out") -replace '\D', ''
+    if ($digits) { return [int]$digits }
+    return 0
+}
+
+function Test-WirelessDebugging([string]$Target) {
+    $out = adb -s $Target shell settings get global adb_wifi_enabled 2>$null
+    return (("$out").Trim() -eq '1')
+}
+
+function Enable-WirelessDebugging([string]$Target) {
+    # The adb shell user holds WRITE_SECURE_SETTINGS, so this also restores a
+    # toggle that an earlier adbd restart switched off.
+    $null = adb -s $Target shell settings put global adb_wifi_enabled 1 2>$null
+}
+
+function Get-MdnsTargetForSerial([string]$Serial) {
+    if (-not $Serial) { return '' }
+    $key = $Serial.ToUpper()
+    foreach ($m in (Get-MdnsEntries)) {
+        if ($m[0] -eq $key) { return $m[1] }
+    }
+    return ''
+}
+
+function Wait-MdnsTarget([string]$Serial, [int]$Seconds = 20) {
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $hit = Get-MdnsTargetForSerial $Serial
+        if ($hit) { return $hit }
+        Start-Sleep -Seconds 2
+    }
+    return ''
+}
+
+function Repair-Transport([string]$Target) {
+    # Host side only: 'adb usb' / 'adb tcpip' would restart adbd on the phone
+    # and drop its wireless-debugging session.
+    $null = adb disconnect $Target 2>&1
+    $null = adb reconnect offline 2>&1
+}
+
+function Connect-Target([string]$Target, [int]$Attempts = 3,
+                        [string]$ExpectSerial = '') {
+    $want = $ExpectSerial.ToUpper()
     for ($i = 1; $i -le $Attempts; $i++) {
         Write-Log 'INFO' "Attempt $i/$Attempts -> $Target"
         $null = adb connect $Target 2>&1
         Start-Sleep -Seconds 1
         if (Test-TargetConnected $Target) {
+            $got = Get-TargetSerial $Target
+            if ($want -and $got -and $want -ne $got) {
+                # A different phone inherited this address; do not adopt it.
+                $null = adb disconnect $Target 2>&1
+                Write-Log 'ERR' "$Target belongs to a different device ($got)"
+                return $false
+            }
             Write-Log 'OK' "Connected and verified: $Target"
             return $true
         }
+        Repair-Transport $Target
     }
     return $false
 }
@@ -186,60 +253,127 @@ function Invoke-ConnectUsb {
     }
     foreach ($d in $usb) {
         Write-Host "`nDevice: $($d.Serial) [$($d.Model)]"
-        Write-Log 'INFO' "Enabling TCP/IP mode on port $Port..."
-        $null = adb -s $d.Serial tcpip $Port 2>&1
-        Start-Sleep -Seconds 3
+        $ident = Get-TargetSerial $d.Serial
+        if (-not $ident) { $ident = $d.Serial.ToUpper() }
+        $sdk = Get-DeviceSdk $d.Serial
         $done = $false
-        foreach ($ip in (Get-PhoneIps $d.Serial)) {
-            $target = "$ip`:$Port"
-            if (Connect-Target $target $Retries) {
-                Add-CacheEntry $d.Serial $ip $Port $d.Model
+
+        # Preferred path on Android 11+: connect to the wireless-debugging
+        # service the phone already advertises. No adbd restart, so the
+        # Wireless-debugging toggle stays on.
+        if ($sdk -ge 30) {
+            $target = Get-MdnsTargetForSerial $ident
+            if (-not $target) {
+                if (-not (Test-WirelessDebugging $d.Serial)) {
+                    Write-Log 'INFO' 'Turning wireless debugging on over the cable...'
+                    Enable-WirelessDebugging $d.Serial
+                }
+                Write-Log 'INFO' 'Waiting for the wireless-debugging mDNS advert...'
+                $target = Wait-MdnsTarget $ident 20
+            }
+            if ($target -and (Connect-Target $target $Retries $ident)) {
+                $parts = $target -split ':'
+                Add-CacheEntry $ident $parts[0] ([int]$parts[1]) $d.Model
+                Resume-Device $ident
                 Invoke-Scrcpy $target $d.Model
                 Write-Log 'OK' 'You can unplug the USB cable now.'
                 $done = $true
-                break
             }
         }
+
+        if (-not $done) {
+            # Fallback. This restarts adbd, which is what switches the
+            # Android 11+ wireless-debugging toggle off, so it is restored
+            # afterwards when the user had it on.
+            $wifiWasOn = Test-WirelessDebugging $d.Serial
+            Write-Log 'WARN' 'No wireless debugging available - falling back to tcpip.'
+            $null = adb -s $d.Serial tcpip $Port 2>&1
+            Start-Sleep -Seconds 3
+            foreach ($ip in (Get-PhoneIps $d.Serial)) {
+                $target = "$ip`:$Port"
+                if (Connect-Target $target $Retries $ident) {
+                    Add-CacheEntry $ident $ip $Port $d.Model
+                    Resume-Device $ident
+                    Invoke-Scrcpy $target $d.Model
+                    Write-Log 'OK' 'You can unplug the USB cable now.'
+                    $done = $true
+                    break
+                }
+            }
+            if ($wifiWasOn) {
+                Enable-WirelessDebugging $d.Serial
+                Write-Log 'INFO' 'Wireless debugging toggle switched back on.'
+            }
+        }
+
         if (-not $done) { Write-Log 'ERR' "All attempts failed for $($d.Model)" }
     }
+}
+
+function Get-KnownDevices {
+    # One entry per device: @(serial, target, label). A fresh mDNS advert wins
+    # over the saved port, since Android rotates the wireless-debugging port
+    # on every reboot and Wi-Fi toggle. Merging on the serial here is what
+    # keeps the same phone from being visited twice in one pass.
+    $seen = @{}
+    $rows = @()
+    foreach ($m in (Get-MdnsEntries)) {
+        $key = $m[0]
+        if ($key -and -not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            $rows += , @($key, $m[1], 'mDNS')
+        }
+    }
+    foreach ($entry in (Get-CachedTargets)) {
+        $key = $entry[2]
+        if (-not $key) { $key = $entry[0] }
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $rows += , @($entry[2], $entry[0], $entry[1])
+    }
+    return $rows
 }
 
 function Invoke-Reconnect {
     [CmdletBinding()]
     param([switch]$Auto)
 
-    $targets = @(Get-CachedTargets)
-    $knownTargets = $targets | ForEach-Object { $_[0] }
-    foreach ($m in (Get-MdnsEntries)) {
-        if ($knownTargets -notcontains $m[1]) {
-            $targets += , @($m[1], 'mDNS', $m[0])
-        }
-    }
-
-    $suspended = @(Get-Suspended)
-    if ($targets.Count -eq 0) {
+    $rows = @(Get-KnownDevices)
+    if ($rows.Count -eq 0) {
         Write-Log 'WARN' 'No saved devices. Plug a device via USB and run once.'
         return
     }
-    foreach ($entry in $targets) {
-        $t = $entry[0]
-        $label = if ($entry.Count -gt 1) { $entry[1] } else { 'mDNS' }
-        $serial = if ($entry.Count -gt 2) { $entry[2] } else { '' }
+    $suspended = @(Get-Suspended)
+    foreach ($entry in $rows) {
+        $serial = $entry[0]
+        $target = $entry[1]
+        $label = $entry[2]
         if ($Auto -and $serial -and $suspended -contains $serial.ToUpper()) {
             continue
         }
-        if (Test-TargetConnected $t) {
-            Write-Log 'OK' "Already connected: $t [$label]"
+        if ((Test-TargetConnected $target)) {
+            Write-Log 'OK' "Already connected: $target [$label]"
             Resume-Device $serial
             continue
         }
-        Write-Log 'INFO' "Reconnecting saved device: $t ($label)"
-        if (Connect-Target $t $Retries) {
-            Invoke-Scrcpy $t $label
-            Resume-Device $serial
-        } else {
-            Write-Log 'ERR' "Failed: $t"
+        $candidates = @()
+        $fresh = Get-MdnsTargetForSerial $serial
+        foreach ($c in @($fresh, $target)) {
+            if ($c -and $candidates -notcontains $c) { $candidates += $c }
         }
+        $done = $false
+        foreach ($c in $candidates) {
+            Write-Log 'INFO' "Reconnecting: $c ($label)"
+            if (Connect-Target $c $Retries $serial) {
+                $parts = $c -split ':'
+                Add-CacheEntry $serial $parts[0] ([int]$parts[1]) $label
+                Resume-Device $serial
+                Invoke-Scrcpy $c $label
+                $done = $true
+                break
+            }
+        }
+        if (-not $done) { Write-Log 'ERR' "Failed: $target" }
     }
 }
 
@@ -252,10 +386,10 @@ function Invoke-WatchLoop {
 }
 
 function Invoke-Disconnect([string]$What = 'all') {
+    # Host side only: the phone keeps its Wireless-debugging toggle as-is.
     foreach ($d in (Get-DeviceList)) {
         if ($d.State -eq 'device' -and -not $d.Usb) {
-            $sn = adb -s $d.Serial shell getprop ro.serialno 2>$null
-            Suspend-Device ("$sn").Trim()
+            Suspend-Device (Get-TargetSerial $d.Serial)
         }
     }
     if ($What -eq 'all') { $null = adb disconnect 2>&1 }
@@ -285,13 +419,39 @@ function Invoke-Pair([string]$Target, [string]$Code) {
         Write-Log 'OK' "Found: $Target"
     }
     if (-not $Code) { $Code = Read-Host 'Enter the 6-digit pairing code' }
+    if ($Code -notmatch '^\d{6}$') {
+        Write-Log 'ERR' 'The pairing code must be exactly 6 digits.'
+        return
+    }
     $null = adb pair $Target $Code 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Write-Log 'OK' "Paired with $Target"
-        $conn = Get-MdnsTargets | Select-Object -First 1
-        if ($conn) { $null = Connect-Target $conn 2 }
-    } else {
+    if ($LASTEXITCODE -ne 0) {
         Write-Log 'ERR' 'Pairing failed. Check the code and keep the dialog open.'
+        return
+    }
+    Write-Log 'OK' "Paired with $Target"
+    # The connect service uses a different port than pairing and is published
+    # a moment later, so wait for the advert instead of racing it.
+    Write-Log 'INFO' 'Waiting for the wireless-debugging mDNS advert...'
+    $conn = ''
+    $deadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $deadline -and -not $conn) {
+        $conn = Get-MdnsTargets | Select-Object -First 1
+        if (-not $conn) { Start-Sleep -Seconds 2 }
+    }
+    if (-not $conn) {
+        Write-Log 'ERR' 'Paired, but the phone never advertised a connect service.'
+        return
+    }
+    if (Connect-Target $conn $Retries) {
+        $serial = Get-TargetSerial $conn
+        $model = (Get-DeviceList | Where-Object { $_.Serial -eq $conn } |
+            Select-Object -First 1).Model
+        if (-not $model) { $model = $serial }
+        $parts = $conn -split ':'
+        if ($serial) {
+            Add-CacheEntry $serial $parts[0] ([int]$parts[1]) $model
+        }
+        Invoke-Scrcpy $conn $model
     }
 }
 
@@ -305,27 +465,38 @@ function Invoke-Doctor {
     }
     $ver = adb version 2>$null | Select-Object -First 1
     Write-Log 'INFO' "$ver"
-    Write-Log 'INFO' "mDNS : $(adb mdns check 2>$null)"
-    Write-Log 'INFO' "Cache: $script:CacheFile ($(Get-CachedTargets).Count devices)"
+    $mdns = (adb mdns check 2>$null | Out-String).Trim()
+    Write-Log 'INFO' "mDNS : $mdns"
+    if ($mdns -notmatch 'mdns daemon version') {
+        Write-Log 'WARN' ('Without mDNS there is no auto-discovery or QR ' +
+                          'pairing, and the tool must fall back to tcpip.')
+    }
+    Write-Log 'INFO' "Cache: $script:CacheFile ($(@(Get-CachedTargets).Count) rows)"
+    Write-Log 'INFO' "Known: $(@(Get-KnownDevices).Count) unique devices"
     Write-Log 'INFO' "Log  : $script:LogFile"
     Show-List
 }
 
 function Show-Help {
     Write-Host @"
-ADB Wireless Manager v12.0 (Windows)
+ADB Wireless Manager v14.0.0 (Windows)
 
 Usage: .\scripts\adbconnect.ps1 [command] [-Port N] [-Retries N] [-NoScrcpy]
 
 Commands:
-  connect      (default) enable TCP/IP over USB, connect and verify
-  reconnect|r  reconnect saved devices without a cable (cache + mDNS)
+  connect      (default) take USB-attached devices wireless and verify
+  reconnect|r  reconnect known devices without a cable (mDNS + cache)
   list|l       show current adb devices
-  disconnect   drop all wireless connections
-  pair         Android 11+ wireless debugging pairing (mDNS discovery)
-  watch        keep devices connected (auto-healing loop)
+  disconnect   drop wireless links on this machine
+  pair         Android 11+ wireless pairing (mDNS discovery)
+  watch        keep known devices connected (healing loop)
   doctor       environment diagnostics
   help         this screen
+
+On Android 11 and newer, connect uses the phone's wireless-debugging service
+discovered over mDNS. The classic 'adb tcpip' path is only used when that is
+unavailable, because it restarts adbd and switches the phone's
+Wireless-debugging toggle off.
 "@
 }
 
