@@ -1,5 +1,6 @@
 name: Release
 
+# Only tag pushes build a release. `git tag -a vX.Y.Z && git push origin vX.Y.Z`
 on:
   push:
     tags: ['v*']
@@ -28,20 +29,38 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # Install from requirements.txt so the binary gets the same pins as a
+      # source install. Installing bare `qrcode` here would omit Pillow and
+      # QR pairing would fail at runtime in the released binary only.
       - name: Install dependencies
-        run: pip install PyQt5 qrcode pyinstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
       - name: Build binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           python -m PyInstaller --onefile --noconsole --clean `
+            --collect-submodules qrcode `
             --name ${{ matrix.name }} tray/adbtray.py
       - name: Build binary (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
           python -m PyInstaller --onefile --clean \
+            --collect-submodules qrcode \
             --name ${{ matrix.name }} tray/adbtray.py
+      # A zero-byte or missing artifact must fail the job, not quietly produce
+      # an empty release.
+      - name: Verify artifact
+        shell: bash
+        run: |
+          f="dist/${{ matrix.name }}${{ matrix.ext }}"
+          test -s "$f" || { echo "::error::$f is missing or empty"; exit 1; }
+          ls -l "$f"
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ matrix.name }}${{ matrix.ext }}*
+          files: dist/${{ matrix.name }}${{ matrix.ext }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true

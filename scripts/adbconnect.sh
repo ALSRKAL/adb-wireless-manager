@@ -310,7 +310,13 @@ state_of() { # exact adb state string for a serial/target
     adbc devices 2>>"$LOG_FILE" | awk -v s="$1" '$1==s{print $2; exit}'
 }
 
-is_ready() { [[ "$(state_of "$1")" == "device" ]]; }
+is_ready() { # adb lists the target as usable (says nothing about responsiveness)
+    [[ "$(state_of "$1")" == "device" ]]
+}
+
+is_live() { # listed as usable AND actually answering commands
+    is_ready "$1" && alive "$1"
+}
 
 alive() { # real command round-trip, not just list presence
     [[ "$(adbq -s "$1" shell echo ok 2>/dev/null | tr -d '\r\n')" == "ok" ]]
@@ -677,7 +683,7 @@ candidate_targets() { # serial target -> one address per line, best first
 
 attach_known() { # serial target label -> 0 when connected and verified
     local serial="$1" target="$2" label="$3" cand
-    if [[ "$(state_of "$target")" == "device" ]] && alive "$target"; then
+    if is_live "$target"; then
         log OK "$(t already "$target [$label]")"
         suspend_del "$serial"
         return 0
@@ -778,7 +784,7 @@ action_pair() { # Android 11+ wireless debugging
 
 heal_one() { # serial target label - restore one dropped link, quietly
     local serial="$1" target="$2" label="$3" cand
-    [[ "$(state_of "$target")" == "device" ]] && alive "$target" && return 0
+    is_live "$target" && return 0
     log WARN "$(t watch_lost "$target")"
     # scrcpy stays on-demand here: popping a mirror window out of a background
     # loop is intrusive.

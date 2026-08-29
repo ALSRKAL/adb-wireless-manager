@@ -55,11 +55,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # keep this list in step with SHELL_FILES in tests/run_tests.sh, so a
+      # local run cannot pass while CI fails
       - name: shellcheck
         run: |
-          shellcheck scripts/adbconnect.sh install.sh uninstall.sh
-      - name: bash syntax (installers)
-        run: bash -n install.sh uninstall.sh
+          shellcheck scripts/adbconnect.sh install.sh uninstall.sh \
+            tests/run_tests.sh
+      - name: bash syntax
+        run: |
+          bash -n scripts/adbconnect.sh
+          bash -n install.sh
+          bash -n uninstall.sh
+          bash -n tests/run_tests.sh
 
   lint-powershell:
     runs-on: windows-latest

@@ -4,52 +4,94 @@
 #  Usage:
 #    ./tests/run_tests.sh          static + unit tests (no device needed)
 #    LIVE=1 ./tests/run_tests.sh   also run live system/device checks
+#
+#  Runs the same checks CI does, so a push cannot fail on something that was
+#  reproducible here.
 # ==============================================================================
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || {
+    printf 'cannot enter the project directory\n' >&2
+    exit 1
+}
+
+UNIT_LOG="${TMPDIR:-/tmp}/awm_unittest.log"
+
+# every shell file CI lints, kept in one place
+SHELL_FILES=(scripts/adbconnect.sh install.sh uninstall.sh tests/run_tests.sh)
 
 pass=0; fail=0
 ok()   { printf '  \033[0;32m[ PASS ]\033[0m %s\n' "$1"; pass=$((pass+1)); }
 bad()  { printf '  \033[0;31m[ FAIL ]\033[0m %s\n' "$1"; fail=$((fail+1)); }
+skip() { printf '  \033[2m[ SKIP ]\033[0m %s\n' "$1"; }
 title(){ printf '\n\033[1m-- %s --\033[0m\n' "$1"; }
 
-title "Static checks"
-if bash -n scripts/adbconnect.sh; then ok "bash syntax: scripts/adbconnect.sh"; else bad "bash syntax"; fi
-for f in tray/adbtray.py tests/test_core.py; do
-    if python3 -m py_compile "$f"; then ok "python compile: $f"; else bad "python compile: $f"; fi
+title "Shell syntax"
+for f in "${SHELL_FILES[@]}"; do
+    if bash -n "$f"; then ok "bash syntax: $f"; else bad "bash syntax: $f"; fi
 done
-if command -v pwsh >/dev/null 2>&1; then
-    if pwsh -NoProfile -Command "\$null = [scriptblock]::Create((Get-Content -Raw scripts/adbconnect.ps1))" \
-        >/dev/null 2>&1; then ok "powershell parse: scripts/adbconnect.ps1"
-    else bad "powershell parse"; fi
+
+title "Shellcheck"
+if command -v shellcheck >/dev/null 2>&1; then
+    if shellcheck "${SHELL_FILES[@]}"; then
+        ok "shellcheck: ${#SHELL_FILES[@]} files clean"
+    else
+        bad "shellcheck reported findings (CI treats these as failures)"
+    fi
 else
-    printf '  \033[2m- SKIP powershell parse (pwsh not installed on this machine)\033[0m\n'
+    skip "shellcheck not installed - CI will still run it"
+fi
+
+title "Python"
+for f in tray/adbtray.py tests/test_core.py; do
+    if python3 -m py_compile "$f"; then ok "compile: $f"; else bad "compile: $f"; fi
+done
+
+title "PowerShell"
+if command -v pwsh >/dev/null 2>&1; then
+    for f in scripts/adbconnect.ps1 install.ps1; do
+        if pwsh -NoProfile -Command \
+            "\$null = [scriptblock]::Create((Get-Content -Raw $f))" \
+            >/dev/null 2>&1
+        then ok "parse: $f"
+        else bad "parse: $f"; fi
+    done
+else
+    skip "pwsh not installed - CI will still run it"
 fi
 
 title "Unit tests (core logic)"
-if python3 tests/test_core.py >/tmp/awm_unittest.log 2>&1; then
-    ok "unittest: $(grep -c '^ok\| ok$' /tmp/awm_unittest.log 2>/dev/null || echo 'all') tests passed"
-    tail -3 /tmp/awm_unittest.log | sed 's/^/      /'
+if python3 tests/test_core.py >"$UNIT_LOG" 2>&1; then
+    ok "unittest: $(grep -c '^ok\| ok$' "$UNIT_LOG" 2>/dev/null || echo 'all') tests passed"
+    tail -3 "$UNIT_LOG" | sed 's/^/      /'
 else
-    bad "unittest - see /tmp/awm_unittest.log"
-    tail -15 /tmp/awm_unittest.log
+    bad "unittest - see $UNIT_LOG"
+    tail -15 "$UNIT_LOG"
 fi
-
-title "Installer sanity"
-if bash -n install.sh && bash -n uninstall.sh; then ok "bash syntax: installers"; else bad "installer syntax"; fi
 
 if [[ "${LIVE:-0}" == "1" ]]; then
     title "Live environment checks"
-    command -v adb >/dev/null 2>&1 && ok "adb installed" || bad "adb missing"
-    command -v scrcpy >/dev/null 2>&1 && ok "scrcpy installed" || bad "scrcpy missing"
-    python3 -c "import PyQt5" >/dev/null 2>&1 && ok "PyQt5 importable" || bad "PyQt5 missing"
-    adb start-server >/dev/null 2>&1; ok "adb server responsive ($(adb devices | grep -cE 'device|offline|unauthorized') entries)"
-    pgrep -f "[t]ray/adbtray.py$" >/dev/null && ok "tray app running" \
-        || printf '  \033[2m- INFO tray not currently running\033[0m\n'
+    if command -v adb >/dev/null 2>&1; then ok "adb installed"
+    else bad "adb missing"; fi
+    if command -v scrcpy >/dev/null 2>&1; then ok "scrcpy installed"
+    else skip "scrcpy not installed (optional)"; fi
+    if python3 -c "import PyQt5" >/dev/null 2>&1; then ok "PyQt5 importable"
+    else bad "PyQt5 missing"; fi
+    if command -v adb >/dev/null 2>&1; then
+        adb start-server >/dev/null 2>&1
+        ok "adb server responsive ($(adb devices \
+            | grep -cE 'device|offline|unauthorized') entries)"
+        if adb mdns check 2>/dev/null | grep -qi 'mdns daemon version'; then
+            ok "adb has an mDNS backend"
+        else
+            skip "adb lacks mDNS - auto-discovery and QR pairing unavailable"
+        fi
+    fi
+    if pgrep -f "[t]ray/adbtray.py$" >/dev/null; then ok "tray app running"
+    else skip "tray not currently running"; fi
     if command -v systemctl >/dev/null 2>&1; then
-        [[ "$(systemctl --user is-active adbwatch.service)" == "active" ]] \
-            && ok "watch service active" \
-            || printf '  \033[2m- INFO watch service not active\033[0m\n'
+        if [[ "$(systemctl --user is-active adbwatch.service)" == "active" ]]
+        then ok "watch service active"
+        else skip "watch service not active"; fi
     fi
 fi
 
