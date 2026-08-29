@@ -40,7 +40,7 @@ jobs:
                 done
             if [ -n "$GITHUB_STEP_SUMMARY" ]; then
               {
-                echo "### ❌ Unit tests failed on $RUNNER_OS"
+                echo "### Unit tests failed on $RUNNER_OS"
                 echo '```'
                 tail -60 test_output.log
                 echo '```'

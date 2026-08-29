@@ -23,16 +23,16 @@ for arg in "$@"; do
     esac
 done
 
-ok()   { printf '  \033[0;32m✔\033[0m %s\n' "$1"; }
-warn() { printf '  \033[1;33m!\033[0m %s\n' "$1"; }
-fail() { printf '  \033[0;31m✘\033[0m %s\n' "$1"; }
+ok()   { printf '  \033[0;32m[ OK ]\033[0m %s\n' "$1"; }
+warn() { printf '  \033[1;33m[WARN]\033[0m %s\n' "$1"; }
+fail() { printf '  \033[0;31m[FAIL]\033[0m %s\n' "$1"; }
 
 echo "=== ADB Wireless Manager installer ==="
 
 if command -v adb >/dev/null 2>&1; then
     ok "adb found: $(command -v adb)"
 else
-    fail "adb missing — install it: sudo apt install adb  (or download Android platform-tools)"
+    fail "adb missing - install it: sudo apt install adb  (or download Android platform-tools)"
 fi
 
 # distro adb builds often ship without the mDNS daemon (breaks auto
@@ -41,7 +41,7 @@ if command -v adb >/dev/null 2>&1; then
     if adb mdns check 2>/dev/null | grep -qi "enabled\|daemon version"; then
         ok "adb mDNS backend available"
     elif [[ ! -d "$HOME/.local/share/awm/platform-tools" ]]; then
-        warn "system adb lacks mDNS — downloading official platform-tools…"
+        warn "system adb lacks mDNS - downloading official platform-tools..."
         case "$(uname -s)" in
             Darwin) PT_URL="https://dl.google.com/android/repository/platform-tools-latest-darwin.zip" ;;
             *)      PT_URL="https://dl.google.com/android/repository/platform-tools-latest-linux.zip" ;;
@@ -57,7 +57,7 @@ PY
                 -type f -exec chmod +x {} + 2>/dev/null
             ok "official platform-tools installed to ~/.local/share/awm/"
         else
-            warn "download failed — QR/auto-discovery needs official platform-tools"
+            warn "download failed - QR/auto-discovery needs official platform-tools"
         fi
         rm -f "$TMPZ"
     fi
@@ -66,13 +66,13 @@ fi
 if command -v python3 >/dev/null 2>&1; then
     ok "python3: $(python3 --version)"
 else
-    fail "python3 missing — install Python 3.9+"
+    fail "python3 missing - install Python 3.9+"
 fi
 
 if python3 -c "import PyQt5" >/dev/null 2>&1; then
     ok "PyQt5 installed"
 else
-    warn "PyQt5 missing — trying pip..."
+    warn "PyQt5 missing - trying pip..."
     if command -v pip3 >/dev/null 2>&1; then
         if pip3 install --user PyQt5 >/dev/null 2>&1; then
             ok "PyQt5 installed via pip"
@@ -134,7 +134,7 @@ EOF
         warn "Could not start adbwatch.service automatically"
     fi
 elif $WITH_WATCH; then
-    warn "systemd not available — skipping watch service"
+    warn "systemd not available - skipping watch service"
 fi
 
 echo

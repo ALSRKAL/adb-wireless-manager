@@ -60,7 +60,7 @@ if ($pyw) {
     $lnk.Save()
     Write-Ok "Tray autostart -> $startup\ADB Wireless Tray.lnk"
 } else {
-    Write-Warn2 "Could not find pythonw.exe — tray autostart skipped."
+    Write-Warn2 "Could not find pythonw.exe - tray autostart skipped."
 }
 
 Write-Host ""
