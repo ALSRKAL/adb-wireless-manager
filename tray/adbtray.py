@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QMenu, QMessageBox, QProgressBar, QPushButton,
                              QSpinBox, QSystemTrayIcon, QVBoxLayout, QWidget)
 
-__version__ = "14.0.0"
+__version__ = "14.0.1"
 REPO = "ALSRKAL/adb-wireless-manager"
 REPO_URL = f"https://github.com/{REPO}"
 
@@ -734,13 +734,17 @@ def heal_offline_transport(target):
 
 
 def enable_wireless_debugging(serial):
-    """Switch Wireless debugging on over an existing transport.
+    """Try to switch Wireless debugging on over an existing transport.
 
-    The adb shell user holds WRITE_SECURE_SETTINGS, so this is also how a
-    toggle that a previous adbd restart switched off gets restored.
+    Best effort, and the result is read back rather than assumed. `settings
+    put` exits 0 even when the framework discards the write, and several
+    vendors (Samsung among them) do exactly that: the toggle is meant to be
+    user-controlled, and Android offers no sanctioned adb command for it. So
+    callers must handle False and tell the user to flip it themselves.
     """
     sh(["adb", "-s", serial, "shell", "settings", "put", "global",
         "adb_wifi_enabled", "1"], 8)
+    time.sleep(2)
     return probe_device(serial, 8)["adb_wifi"] is True
 
 
@@ -756,6 +760,30 @@ def wait_for_mdns_target(serial, deadline_sec=MDNS_WAIT_SECONDS):
         if time.time() >= deadline:
             return ""
         time.sleep(2)
+
+
+def connect_candidates(serial, target, mdns, classic_port=5555):
+    """Pure: addresses to try for one device, best first.
+
+    A fresh mDNS advert beats a saved port, because Android rotates the
+    wireless-debugging port on every reboot and Wi-Fi toggle.
+
+    An advert also outlives the service it describes, so a refused advert does
+    not mean the phone is gone: a device taken wireless through the legacy path
+    still listens on the fixed port. Every host we know of therefore gets the
+    fixed port tried too, before giving up on the device.
+    """
+    serial = norm_serial(serial)
+    fresh = mdns_target_for_serial(mdns, serial) if serial else None
+    out = []
+    for t in (fresh, target):
+        if t and t not in out:
+            out.append(t)
+    for host in [target_host(t) for t in list(out)]:
+        legacy = f"{host}:{classic_port}"
+        if host and legacy not in out:
+            out.append(legacy)
+    return out
 
 
 def connect_and_verify(target, expect_serial="", attempts=None):
@@ -2255,13 +2283,8 @@ class Tray(QSystemTrayIcon):
         can never drift apart. Returns (ok, target, detail).
         """
         want = norm_serial(serial)
-        candidates = []
-        fresh = mdns_target_for_serial(mdns_entries(), want) if want else ""
-        # A fresh mDNS advert beats a saved port: Android rotates the
-        # wireless-debugging port on every reboot and Wi-Fi toggle.
-        for t in (fresh, target):
-            if t and t not in candidates:
-                candidates.append(t)
+        candidates = connect_candidates(
+            want, target, mdns_entries(), S.get("start_port") or 5555)
         if not candidates:
             return False, target, tr("لا يوجد عنوان معروف لهذا الجهاز",
                                      "no known address for this device")
@@ -2271,19 +2294,28 @@ class Tray(QSystemTrayIcon):
             if ok:
                 found = got or want or device_serial(t)
                 suspend_del(found)
-                save_cache_entry(found, t, label or self._label_for(t, found))
+                # Now that the device answers, store its real model rather
+                # than whatever placeholder the discovery source supplied.
+                save_cache_entry(found, t, self._label_for(t, found, label))
                 return True, t, ""
             last = reason
         return False, candidates[0], last
 
-    def _label_for(self, target, serial=""):
+    PLACEHOLDER_LABELS = ("", "mDNS", "?")
+
+    def _label_for(self, target, serial="", preferred=""):
+        """Best human name for a device: its model, then a known row, then id."""
+        model = probe_device(target, 6)["model"]
+        if model:
+            return model
+        if preferred not in self.PLACEHOLDER_LABELS:
+            return preferred
         for r in self.view:
             if target in (r["usb_target"], r["net_target"],
                           r["known_target"]) \
                     or (serial and r["serial"] == norm_serial(serial)):
                 return r["label"]
-        probe = probe_device(target, 6)
-        return probe["model"] or serial or target
+        return serial or target
 
     def reconnect_all(self):
         def job():
@@ -2348,8 +2380,18 @@ class Tray(QSystemTrayIcon):
             mdns_target_for_serial(mdns_entries(), ident))
 
         if strategy == STRATEGY_ENABLE_WIFI:
-            enable_wireless_debugging(serial)
-            target = wait_for_mdns_target(ident)
+            if enable_wireless_debugging(serial):
+                target = wait_for_mdns_target(ident)
+            else:
+                # The vendor discarded the write; the user has to flip the
+                # toggle by hand. Say so instead of silently degrading.
+                notify(tr("التصحيح اللاسلكي مغلق", "Wireless debugging is off"),
+                       tr(f"{label}: لم يسمح النظام بتفعيله تلقائيًا. فعّله من "
+                          f"خيارات المطوّر، أو تابع الآن بمنفذ ثابت.",
+                          f"{label}: the system refused to enable it "
+                          f"automatically. Turn it on in Developer options, "
+                          f"or continue now on a fixed port."))
+                target = ""
             strategy = STRATEGY_MDNS if target else STRATEGY_TCPIP
         elif strategy == STRATEGY_AWAIT_MDNS:
             target = wait_for_mdns_target(ident)
@@ -2380,15 +2422,32 @@ class Tray(QSystemTrayIcon):
         for ip in phone_ips(serial):
             ok, used, reason = self._attach(f"{ip}:{port}", ident, label)
             if ok:
-                if wifi_was_on:
-                    enable_wireless_debugging(serial)
-                return tr(f"{label}: متصل عبر {used} (منفذ ثابت)",
-                          f"{label}: connected via {used} (fixed port)")
+                return tr(f"{label}: متصل عبر {used} (منفذ ثابت)"
+                          f"{self._restore_wireless(serial, wifi_was_on)}",
+                          f"{label}: connected via {used} (fixed port)"
+                          f"{self._restore_wireless(serial, wifi_was_on)}")
             detail = reason
-        if wifi_was_on:
-            enable_wireless_debugging(serial)
-        return tr(f"{label}: فشل - {detail or 'لا يوجد عنوان IP على الواي فاي'}",
-                  f"{label}: failed - {detail or 'no Wi-Fi address found'}")
+        return tr(f"{label}: فشل - {detail or 'لا يوجد عنوان IP على الواي فاي'}"
+                  f"{self._restore_wireless(serial, wifi_was_on)}",
+                  f"{label}: failed - {detail or 'no Wi-Fi address found'}"
+                  f"{self._restore_wireless(serial, wifi_was_on)}")
+
+    def _restore_wireless(self, serial, wifi_was_on):
+        """Put the Wireless-debugging toggle back after an adbd restart.
+
+        Reports what actually happened. Claiming it was restored when the
+        vendor discarded the write is how a user ends up thinking the tool
+        broke their phone settings silently.
+        """
+        if not wifi_was_on:
+            return ""
+        if enable_wireless_debugging(serial):
+            return tr("\nأُعيد تفعيل التصحيح اللاسلكي.",
+                      "\nWireless debugging switched back on.")
+        return tr("\nتنبيه: أعاد النظام إغلاق التصحيح اللاسلكي - فعّله يدويًا "
+                  "من خيارات المطوّر.",
+                  "\nNote: the system left wireless debugging off. Turn it "
+                  "back on in Developer options.")
 
     def disconnect_all(self):
         """Drop wireless links on the host side only; the phone keeps its

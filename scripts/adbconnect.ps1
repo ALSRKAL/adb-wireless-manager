@@ -1,5 +1,5 @@
 # ==============================================================================
-#  ADB Wireless Manager - Windows CLI  v14.0.0
+#  ADB Wireless Manager - Windows CLI  v14.0.1
 #  connect / reconnect / list / disconnect / pair / watch / doctor
 #  Prefers Android 11+ wireless debugging over mDNS; the classic 'adb tcpip'
 #  path is a fallback only, because it restarts adbd and switches the phone's
@@ -479,7 +479,7 @@ function Invoke-Doctor {
 
 function Show-Help {
     Write-Host @"
-ADB Wireless Manager v14.0.0 (Windows)
+ADB Wireless Manager v14.0.1 (Windows)
 
 Usage: .\scripts\adbconnect.ps1 [command] [-Port N] [-Retries N] [-NoScrcpy]
 

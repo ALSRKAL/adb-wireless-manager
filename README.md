@@ -24,17 +24,36 @@ This tool therefore picks its path per device:
 | Device state | Path taken | Effect on the phone |
 |--------------|------------|---------------------|
 | Android 11+, already advertising over mDNS | connect to the advertised port | nothing is changed |
-| Android 11+, toggle off | set `adb_wifi_enabled`, wait for the advert | toggle switched on |
+| Android 11+, toggle off | try to set `adb_wifi_enabled`, wait for the advert | toggle switched on when the vendor allows it |
 | Android 11+, toggle on but no advert yet | wait for the advert | nothing is changed |
 | Android 10 or older, or no mDNS support | `adb tcpip` fallback | `adbd` restarts, toggle restored afterwards |
+
+Enabling the toggle from adb is best effort. `settings put global
+adb_wifi_enabled 1` exits successfully even when the framework discards the
+write, and several vendors do exactly that: the switch is meant to be user
+controlled and Android offers no sanctioned command for it. The tool reads the
+value back, and if it did not stick it says so and asks you to flip the switch
+yourself rather than pretending it worked.
 
 Disconnecting is always host-side only: `adb disconnect`, never `adb usb` and
 never `adb tcpip`. Your Wireless-debugging toggle stays exactly as you left it.
 
+### Reconnecting
+
+An mDNS advert outlives the service it describes, so a refused advert does not
+mean the device is gone. Addresses are tried in this order:
+
+1. The address currently advertised over mDNS for that serial.
+2. The address saved for it last time.
+3. The fixed port (5555 by default) on every host seen above, which is where a
+   device that was taken wireless through the legacy path still listens.
+
 Every connection is verified before it is reported as successful: the tool runs
 a real command round-trip and compares the hardware serial against the device
 it was asked to reach, so a phone that has inherited another one's DHCP address
-is refused instead of silently adopted.
+is refused instead of silently adopted. Addresses that refuse the connection or
+cannot be routed fail immediately and the next candidate is tried, rather than
+consuming the whole retry budget.
 
 ## Features
 
@@ -196,7 +215,9 @@ path may call `adb usb`, and no shipped file may contain decorative glyphs.
 | `unauthorized` | Unlock the phone and accept the prompt |
 | Wireless debugging switches itself off | Fixed in 14.0.0. The tool no longer restarts `adbd` on Android 11+, and restores the toggle when the tcpip fallback is unavoidable |
 | The same phone appeared twice in the menu | Fixed in 14.0.0. Rows are merged on the hardware serial; old duplicated cache files are repaired on read |
+| The tool says it could not enable wireless debugging | Your vendor blocks the setting write. Turn the switch on in Developer options; everything else works normally |
 | Reconnect fails right after a phone reboot | The wireless port changed. `reconnect` picks up the new one over mDNS, provided your adb has mDNS support |
+| `Nothing is listening on <address>` | The mDNS advert is stale because wireless debugging went off. The fixed port on the same host is tried next automatically |
 | QR pairing or auto-discovery never sees the phone | Your adb build lacks mDNS. Verify with `adb mdns check`; the installer can fetch Google's platform-tools |
 | Tray icon missing on GNOME | Enable AppIndicators, then log out and back in |
 | Port already in use | Ports are probed upward from 5555 to 5699 |

@@ -921,6 +921,53 @@ class NoAdbdRestartOnHealingTests(unittest.TestCase):
                     f"{rel} contains the decorative glyph {ch!r}")
 
 
+class ConnectCandidateTests(unittest.TestCase):
+    """A refused mDNS advert must not end the search: adverts outlive the
+    service they describe, and a phone taken wireless the legacy way is still
+    listening on the fixed port."""
+
+    SER = "R5CX15D4P7P"
+
+    def test_fresh_advert_comes_first_then_saved_then_classic(self):
+        got = adbtray.connect_candidates(
+            self.SER, "10.17.111.145:5555",
+            [(self.SER, "10.17.111.145:36947")], 5555)
+        self.assertEqual(got, ["10.17.111.145:36947", "10.17.111.145:5555"])
+
+    def test_classic_port_is_added_for_an_advert_only_device(self):
+        got = adbtray.connect_candidates(
+            self.SER, "", [(self.SER, "10.17.111.145:36947")], 5555)
+        self.assertEqual(got, ["10.17.111.145:36947", "10.17.111.145:5555"])
+
+    def test_second_host_also_gets_the_classic_port(self):
+        got = adbtray.connect_candidates(
+            self.SER, "192.168.1.9:41111",
+            [(self.SER, "10.0.0.5:36947")], 5555)
+        self.assertEqual(got, ["10.0.0.5:36947", "192.168.1.9:41111",
+                               "10.0.0.5:5555", "192.168.1.9:5555"])
+
+    def test_no_duplicates_when_saved_port_is_the_classic_one(self):
+        got = adbtray.connect_candidates(self.SER, "10.0.0.5:5555", [], 5555)
+        self.assertEqual(got, ["10.0.0.5:5555"])
+
+    def test_custom_classic_port_is_honoured(self):
+        got = adbtray.connect_candidates(self.SER, "10.0.0.5:41000", [], 5599)
+        self.assertEqual(got, ["10.0.0.5:41000", "10.0.0.5:5599"])
+
+    def test_advert_for_another_serial_is_ignored(self):
+        got = adbtray.connect_candidates(
+            self.SER, "10.0.0.5:5555", [("OTHER", "10.0.0.9:36947")], 5555)
+        self.assertEqual(got, ["10.0.0.5:5555"])
+
+    def test_nothing_known_yields_nothing(self):
+        self.assertEqual(adbtray.connect_candidates("", "", [], 5555), [])
+
+    def test_serial_casing_still_matches_the_advert(self):
+        got = adbtray.connect_candidates(
+            "r5cx15d4p7p", "", [(self.SER, "10.0.0.5:36947")], 5555)
+        self.assertEqual(got[0], "10.0.0.5:36947")
+
+
 class FriendlyConnectErrorTests(unittest.TestCase):
     def test_success_has_no_reason(self):
         self.assertEqual(

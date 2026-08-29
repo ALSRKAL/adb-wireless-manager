@@ -11,7 +11,7 @@
 set -uo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="14.0.0"
+readonly VERSION="14.0.1"
 readonly SCRIPT_NAME="${0##*/}"
 
 # ------------------------------------------------------------------------------
@@ -124,6 +124,8 @@ declare -A T_AR=(
   [via_mdns]="اتصال عبر التصحيح اللاسلكي: %s"
   [legacy]="لا يوجد تصحيح لاسلكي متاح - استخدام tcpip (سيُعاد تشغيل adbd على الهاتف)."
   [wifi_restored]="تم إرجاع مفتاح التصحيح اللاسلكي إلى وضع التشغيل."
+  [wifi_not_restored]="النظام أبقى التصحيح اللاسلكي مغلقًا - فعّله يدويًا من خيارات المطوّر."
+  [wireless_denied]="النظام لم يسمح بتفعيل التصحيح اللاسلكي تلقائيًا - فعّله يدويًا من خيارات المطوّر."
   [failed_dev]="فشلت كل المحاولات لهذا الجهاز. راجع السجل: %s"
   [unplug]="يمكنك سحب كابل USB الآن - الاتصال اللاسلكي شغّال."
   [scrcpy_run]="Scrcpy يعمل بالفعل لهذا الجهاز."
@@ -172,6 +174,8 @@ declare -A T_EN=(
   [via_mdns]="Connected through wireless debugging: %s"
   [legacy]="No wireless debugging available - falling back to tcpip (this restarts adbd on the phone)."
   [wifi_restored]="Wireless debugging toggle switched back on."
+  [wifi_not_restored]="The system left wireless debugging off - turn it back on in Developer options."
+  [wireless_denied]="The system refused to enable wireless debugging - turn it on in Developer options."
   [failed_dev]="All attempts failed for this device. See log: %s"
   [unplug]="You can unplug the USB cable now - the wireless link is live."
   [scrcpy_run]="Scrcpy already running for this device."
@@ -288,6 +292,14 @@ usb_serials() {
     adbc devices 2>>"$LOG_FILE" | awk 'NR>1 && NF>=2 && $1 !~ /:|_adb-tls-/ {print $1"\t"$2}'
 }
 
+resolve_label() { # target fallback -> the device's real model when it answers
+    local target="$1" fallback="${2:-}" model
+    model=$(adbq -s "$target" shell getprop ro.product.model 2>/dev/null \
+        | tr -d '\r\n' | tr '_' ' ')
+    if [[ -n "$model" ]]; then printf '%s' "$model"
+    else printf '%s' "$fallback"; fi
+}
+
 device_label() { # model / product for nicer output
     local s="$1" label
     label=$(adbc devices -l 2>>"$LOG_FILE" | awk -v s="$s" '$1==s{for(i=1;i<=NF;i++) if($i ~ /^model:/){sub("model:","",$i); print $i; exit}}')
@@ -314,10 +326,23 @@ wireless_debugging_on() { # target -> 0 when the Android 11+ toggle is on
         2>/dev/null | tr -d '\r\n')" == "1" ]]
 }
 
-enable_wireless_debugging() { # target
-    # The adb shell user holds WRITE_SECURE_SETTINGS, so this both enables
-    # the toggle and restores one that an earlier adbd restart switched off.
+enable_wireless_debugging() { # target -> 0 only when the toggle really went on
+    # Best effort, and the result is read back rather than assumed. `settings
+    # put` exits 0 even when the framework discards the write, and several
+    # vendors (Samsung among them) do exactly that: the toggle is meant to be
+    # user-controlled and Android offers no sanctioned adb command for it.
     adbq -s "$1" shell settings put global adb_wifi_enabled 1 >/dev/null 2>&1
+    sleep 2
+    wireless_debugging_on "$1"
+}
+
+restore_wireless_debugging() { # target was_on
+    [[ "${2:-false}" == true ]] || return 0
+    if enable_wireless_debugging "$1"; then
+        log OK "$(t wifi_restored)"
+    else
+        log WARN "$(t wifi_not_restored)"
+    fi
 }
 
 mdns_target_for_serial() { # serial -> ip:port advertised for that serial
@@ -522,7 +547,12 @@ wireless_via_mdns() { # usb_serial ident label -> 0 when connected
     if [[ -z "$target" ]]; then
         if ! wireless_debugging_on "$usb"; then
             log INFO "$(t wireless_on)"
-            enable_wireless_debugging "$usb"
+            if ! enable_wireless_debugging "$usb"; then
+                # The vendor discarded the write; the user has to flip the
+                # toggle by hand. Say so instead of degrading silently.
+                log WARN "$(t wireless_denied)"
+                return 1
+            fi
         fi
         log INFO "$(t await_mdns)"
         target=$(wait_for_mdns_target "$ident") || return 1
@@ -556,7 +586,7 @@ wireless_via_tcpip() { # usb_serial ident label port -> 0 when connected
     ips=$(device_ips "$usb")
     if [[ -z "$ips" ]]; then
         log ERR "$(t no_ip)"
-        $wifi_was_on && { enable_wireless_debugging "$usb"; log INFO "$(t wifi_restored)"; }
+        restore_wireless_debugging "$usb" "$wifi_was_on"
         return 1
     fi
     while IFS= read -r ip; do
@@ -565,11 +595,11 @@ wireless_via_tcpip() { # usb_serial ident label port -> 0 when connected
             cache_put "$ident" "$ip" "$port" "$label"
             suspend_del "$ident"
             launch_scrcpy "$ip:$port" "$label"
-            $wifi_was_on && { enable_wireless_debugging "$usb"; log INFO "$(t wifi_restored)"; }
+            restore_wireless_debugging "$usb" "$wifi_was_on"
             return 0
         fi
     done <<< "$ips"
-    $wifi_was_on && { enable_wireless_debugging "$usb"; log INFO "$(t wifi_restored)"; }
+    restore_wireless_debugging "$usb" "$wifi_was_on"
     return 1
 }
 
@@ -625,26 +655,46 @@ known_devices() {
                     !seen[key]++ { print $1"\t"$2"\t"$3 }'
 }
 
+candidate_targets() { # serial target -> one address per line, best first
+    # A fresh mDNS advert beats a saved port, because Android rotates the
+    # wireless-debugging port on every reboot and Wi-Fi toggle.
+    #
+    # An mDNS advert also outlives the service it describes, so a refused
+    # advert does not mean the phone is gone: a device taken wireless through
+    # the legacy path still listens on the fixed port. Every host we know
+    # about therefore gets the fixed port tried too before we give up.
+    local serial="$1" target="$2" fresh cand host
+    fresh=$(mdns_target_for_serial "$serial")
+    { for cand in "$fresh" "$target"; do
+          [[ -n "$cand" ]] && printf '%s\n' "$cand"
+      done
+      for cand in "$fresh" "$target"; do
+          host="${cand%:*}"
+          [[ -n "$host" ]] && printf '%s:%s\n' "$host" "$START_PORT"
+      done
+    } | awk 'NF && !seen[$0]++'
+}
+
 attach_known() { # serial target label -> 0 when connected and verified
-    local serial="$1" target="$2" label="$3" fresh
+    local serial="$1" target="$2" label="$3" cand
     if [[ "$(state_of "$target")" == "device" ]] && alive "$target"; then
         log OK "$(t already "$target [$label]")"
         suspend_del "$serial"
         return 0
     fi
-    fresh=$(mdns_target_for_serial "$serial")
-    local cand
-    for cand in "$fresh" "$target"; do
+    while IFS= read -r cand; do
         [[ -z "$cand" ]] && continue
         log INFO "$(t recon "$cand" "$label")"
         if connect_target "$serial" "${cand%:*}" "${cand##*:}"; then
             suspend_del "$serial"
+            # Now that the device answers, store its real model instead of
+            # whatever placeholder the discovery source supplied.
+            label=$(resolve_label "$cand" "$label")
             cache_put "$serial" "${cand%:*}" "${cand##*:}" "$label"
             launch_scrcpy "$cand" "$label"
             return 0
         fi
-        [[ "$fresh" == "$target" ]] && break
-    done
+    done <<< "$(candidate_targets "$serial" "$target")"
     return 1
 }
 
@@ -727,20 +777,19 @@ action_pair() { # Android 11+ wireless debugging
 }
 
 heal_one() { # serial target label - restore one dropped link, quietly
-    local serial="$1" target="$2" label="$3" fresh cand
+    local serial="$1" target="$2" label="$3" cand
     [[ "$(state_of "$target")" == "device" ]] && alive "$target" && return 0
     log WARN "$(t watch_lost "$target")"
     # scrcpy stays on-demand here: popping a mirror window out of a background
     # loop is intrusive.
-    fresh=$(mdns_target_for_serial "$serial")
-    for cand in "$fresh" "$target"; do
+    while IFS= read -r cand; do
         [[ -z "$cand" ]] && continue
         if connect_target "$serial" "${cand%:*}" "${cand##*:}"; then
-            cache_put "$serial" "${cand%:*}" "${cand##*:}" "$label"
+            cache_put "$serial" "${cand%:*}" "${cand##*:}" \
+                "$(resolve_label "$cand" "$label")"
             return 0
         fi
-        [[ "$fresh" == "$target" ]] && break
-    done
+    done <<< "$(candidate_targets "$serial" "$target")"
     return 1
 }
 
