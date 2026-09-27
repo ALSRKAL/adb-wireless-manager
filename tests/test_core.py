@@ -1227,10 +1227,17 @@ class ScreenOffOnTests(unittest.TestCase):
     def test_stop_kills_only_matching_target(self):
         out = ("111 scrcpy -s 10.0.0.1:5555\n"
                f"222 scrcpy -s {self.T}\n")
-        with mock.patch.object(adbtray, "sh", return_value=out), \
-             mock.patch("os.kill") as kill:
-            self.assertTrue(adbtray.stop_scrcpy(self.T))
-            kill.assert_called_once_with(222, 15)
+        with mock.patch.object(adbtray, "sh", return_value=out):
+            if adbtray.IS_WINDOWS:
+                with mock.patch("subprocess.run") as run:
+                    self.assertTrue(adbtray.stop_scrcpy(self.T))
+                    run.assert_called_once_with(
+                        ["taskkill", "/PID", "222", "/F"],
+                        capture_output=True, timeout=8)
+            else:
+                with mock.patch("os.kill") as kill:
+                    self.assertTrue(adbtray.stop_scrcpy(self.T))
+                    kill.assert_called_once_with(222, 15)
 
     def test_device_screen_on_reports_adb_result(self):
         ok = mock.Mock(returncode=0)
