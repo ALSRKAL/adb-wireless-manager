@@ -855,6 +855,85 @@ def launch_scrcpy(target, extra_args=""):
     return True
 
 
+# --- Screen off/on (same scrcpy method, per-device) ---
+SCREEN_OFF_ARGS = ["-S", "-w", "--power-off-on-close", "--disable-screensaver"]
+
+
+def stop_scrcpy(target):
+    """Kill scrcpy process(es) for one target only. Best effort, never raises."""
+    try:
+        if IS_WINDOWS:
+            # Kill only the scrcpy.exe whose command line contains this target.
+            # PowerShell one-liner: find + Stop-Process, ignore errors.
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"Get-CimInstance Win32_Process -Filter \"Name='scrcpy.exe'\" "
+                 f"| Where-Object {{ $_.CommandLine -like '*-s {target}*' }} "
+                 f"| ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"],
+                capture_output=True, timeout=8,
+            )
+            return True
+        out = sh(["pgrep", "-af", "scrcpy"], 5)
+        killed = False
+        for line in (out or "").splitlines():
+            if f"-s {target}" not in line:
+                continue
+            pid = line.strip().split(None, 1)[0]
+            if not pid.isdigit():
+                continue
+            try:
+                os.kill(int(pid), 15)  # SIGTERM
+                killed = True
+            except Exception:
+                continue
+        return killed
+    except Exception:
+        return False
+
+
+def launch_scrcpy_screen_off(target, extra_args=""):
+    """Relaunch scrcpy for target with screen OFF but mirroring ON.
+
+    Same method as: scrcpy -S -w --power-off-on-close --disable-screensaver
+    Physical touch dies automatically while screen is off, laptop keeps control.
+    """
+    base = str(extra_args if extra_args else (S.get("scrcpy_args") or ""))
+    parts = base.split() if base else []
+    for a in SCREEN_OFF_ARGS:
+        if a not in parts:
+            parts.append(a)
+    if scrcpy_running(target):
+        stop_scrcpy(target)
+        for _ in range(20):
+            if not scrcpy_running(target):
+                break
+            time.sleep(0.15)
+        if scrcpy_running(target):
+            notify(tr("تعذر إعادة تشغيل scrcpy", "Could not restart scrcpy"),
+                   target)
+            return False
+    flags = 0x00000008 if IS_WINDOWS else 0
+    cmd = ["scrcpy", "-s", target] + parts
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=flags, start_new_session=not IS_WINDOWS,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def device_screen_on(target):
+    """Turn physical screen back ON, mirroring keeps working."""
+    sh(["adb", "-s", target, "shell", "input", "keyevent",
+        "KEYCODE_WAKEUP"], 6)
+    time.sleep(0.3)
+    sh(["adb", "-s", target, "shell", "input", "keyevent", "82"], 6)
+    return True
+
+
 def drop_from_cache(target):
     try:
         with open(CACHE_FILE, encoding="utf-8") as f:
@@ -2146,6 +2225,13 @@ class Tray(QSystemTrayIcon):
             target, label = r["target"], r["label"]
             sub.addAction(tr("عرض الشاشة (scrcpy)", "Mirror screen (scrcpy)"))\
                 .triggered.connect(lambda _, t=target: self.run_scrcpy(t))
+            sub.addAction(tr("إطفاء الشاشة (تحكم لابتوب فقط)",
+                             "Screen off (laptop only)"))\
+                .triggered.connect(
+                    lambda _, t=target: self.run_scrcpy_screen_off(t))
+            sub.addAction(tr("تشغيل الشاشة", "Screen on"))\
+                .triggered.connect(
+                    lambda _, t=target: self.turn_screen_on(t))
             sub.addAction(tr("لقطة شاشة", "Screenshot")).triggered.connect(
                 lambda _, t=target, m=label: self.screenshot(t, m))
             sub.addAction(tr(f"تسجيل شاشة ({RECORD_SECONDS} ثانية)",
@@ -2502,6 +2588,22 @@ class Tray(QSystemTrayIcon):
             if launch_scrcpy(target, str(S.get("scrcpy_args") or "")):
                 self.op_done.emit("scrcpy",
                                   tr("جارٍ عرض الشاشة...", "Mirroring..."))
+        self.run_job(job)
+
+    def run_scrcpy_screen_off(self, target):
+        def job():
+            if launch_scrcpy_screen_off(target):
+                self.op_done.emit(
+                    "scrcpy",
+                    tr("الشاشة طافية - تحكم لابتوب فقط",
+                       "Screen off - laptop only"))
+        self.run_job(job)
+
+    def turn_screen_on(self, target):
+        def job():
+            device_screen_on(target)
+            self.op_done.emit("scrcpy",
+                              tr("تم تشغيل الشاشة", "Screen on"))
         self.run_job(job)
 
     def doctor(self):
