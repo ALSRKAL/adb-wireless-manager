@@ -11,7 +11,7 @@
 set -uo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="14.0.1"
+readonly VERSION="14.1.0"
 readonly SCRIPT_NAME="${0##*/}"
 
 # ------------------------------------------------------------------------------
@@ -130,6 +130,10 @@ declare -A T_AR=(
   [unplug]="يمكنك سحب كابل USB الآن - الاتصال اللاسلكي شغّال."
   [scrcpy_run]="Scrcpy يعمل بالفعل لهذا الجهاز."
   [scrcpy_go]="تشغيل Scrcpy..."
+  [screen_off]="إطفاء شاشة %s (تحكم لابتوب فقط)..."
+  [screen_already]="الشاشة طافية بالفعل: %s"
+  [screen_on_ok]="تم تشغيل شاشة %s"
+  [screen_fail]="تعذر تشغيل شاشة %s - تحقق من الاتصال"
   [summary]="الخلاصة"
   [none_conn]="لا توجد اتصالات لاسلكية حالياً."
   [cache_empty]="لا توجد أجهزة محفوظة. وصّل الجهاز بـ USB ونفّذ السكربت مرة واحدة."
@@ -180,6 +184,10 @@ declare -A T_EN=(
   [unplug]="You can unplug the USB cable now - the wireless link is live."
   [scrcpy_run]="Scrcpy already running for this device."
   [scrcpy_go]="Launching scrcpy..."
+  [screen_off]="Turning screen off for %s (laptop only)..."
+  [screen_already]="Screen already off: %s"
+  [screen_on_ok]="Screen on: %s"
+  [screen_fail]="Could not turn screen on for %s - check the connection"
   [summary]="Summary"
   [none_conn]="No wireless connections right now."
   [cache_empty]="No saved devices. Plug in USB and run once."
@@ -542,6 +550,61 @@ launch_scrcpy() { # target label
         >>"$LOG_FILE" 2>&1 9>&- & disown
 }
 
+scrcpy_screen_off() { # target label - mirror with the physical screen off
+    have scrcpy || { log ERR "$(t need scrcpy)"; return 1; }
+    local target="$1" label="${2:-$1}" pid
+    if pgrep -f -- "scrcpy .*-s $target" >/dev/null 2>&1; then
+        if pgrep -af -- scrcpy 2>/dev/null | grep -F -- "-s $target" \
+            | grep -E -q -- '(^| )-S( |$)|--turn-screen-off'; then
+            log INFO "$(t screen_already "$target")"; return 0
+        fi
+        while IFS= read -r pid; do
+            [[ "$pid" =~ ^[0-9]+$ ]] && kill "$pid" 2>/dev/null
+        done < <(pgrep -f -- "scrcpy .*-s $target" 2>/dev/null)
+        sleep 1
+    fi
+    log INFO "$(t screen_off "$target")"
+    # shellcheck disable=SC2086
+    nohup scrcpy -s "$target" --window-title "$label ($target)" \
+        -S -w --power-off-on-close --disable-screensaver $SCRCPY_ARGS \
+        >>"$LOG_FILE" 2>&1 9>&- & disown
+}
+
+screen_on() { # target - wake the physical screen, mirroring continues
+    local target="$1"
+    if ! adbc -s "$target" shell input keyevent KEYCODE_WAKEUP \
+        >>"$LOG_FILE" 2>&1; then
+        log ERR "$(t screen_fail "$target")"; return 1
+    fi
+    sleep 1
+    adbc -s "$target" shell input keyevent 82 >>"$LOG_FILE" 2>&1
+    log OK "$(t screen_on_ok "$target")"
+}
+
+action_screen() { # mode [target|all] - screen off/on for one or all devices
+    local mode="$1" what="${2:-all}" target
+    if [[ "$what" == "all" ]]; then
+        local targets
+        targets=$(adbc devices 2>/dev/null \
+            | awk 'NR>1 && $2=="device" {print $1}')
+        [[ -z "$targets" ]] && { log WARN "$(t none_conn)"; return 1; }
+        while IFS= read -r target; do
+            [[ -z "$target" ]] && continue
+            if [[ "$mode" == "off" ]]; then
+                scrcpy_screen_off "$target" "$target"
+            else
+                screen_on "$target"
+            fi
+        done <<< "$targets"
+    else
+        if [[ "$mode" == "off" ]]; then
+            scrcpy_screen_off "$what" "$what"
+        else
+            screen_on "$what"
+        fi
+    fi
+}
+
 # ------------------------------------------------------------------------------
 # 8) ACTIONS
 # ------------------------------------------------------------------------------
@@ -851,6 +914,8 @@ Commands:
   watch, w           keep known devices connected (healing loop)
   list, l            show current adb devices
   disconnect [t|all] drop wireless links on this machine
+  screen-off [t|all] mirror with the physical screen off (laptop only)
+  screen-on [t|all]  wake the physical screen, mirroring continues
   doctor             environment + config diagnostics
   help               this screen
 
@@ -881,7 +946,7 @@ CMD=""
 ARGS=()
 while (($#)); do
     case "$1" in
-        connect|reconnect|r|pair|watch|w|list|l|disconnect|doctor|help)
+        connect|reconnect|r|pair|watch|w|list|l|disconnect|doctor|help|screen-off|screen-on)
             [[ -z "$CMD" ]] && CMD="$1" || ARGS+=("$1") ;;
         -p|--port)      START_PORT="${2:?}"; shift ;;
         -r|--retries)   MAX_RETRIES="${2:?}"; shift ;;
@@ -928,7 +993,7 @@ fi
 # `connect` or `reconnect` only ever waits for the current pass to finish
 # instead of being refused outright.
 case "$CMD" in
-    list|l|disconnect|doctor|help|watch|w) LOCK_REQUIRED=false ;;
+    list|l|disconnect|doctor|help|watch|w|screen-off|screen-on) LOCK_REQUIRED=false ;;
     *)                                     LOCK_REQUIRED=true ;;
 esac
 
@@ -962,6 +1027,8 @@ case "$CMD" in
     watch|w)      action_watch ;;
     list|l)       action_list ;;
     disconnect)   action_disconnect "${ARGS[0]:-all}" ;;
+    screen-off)   action_screen off "${ARGS[0]:-all}" ;;
+    screen-on)    action_screen on "${ARGS[0]:-all}" ;;
     doctor)       action_doctor ;;
     *)            usage; RC=1 ;;
 esac

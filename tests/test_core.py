@@ -1173,5 +1173,132 @@ class CacheDeduplicationTests(unittest.TestCase):
         self.assertEqual(len(adbtray.cached_entries()), 1)
 
 
+class ScreenOffOnTests(unittest.TestCase):
+    """Per-device screen off/on: same scrcpy -S method as the tray menu."""
+
+    T = "192.168.100.65:5555"
+
+    def test_screen_off_args_contents(self):
+        self.assertIn("-S", adbtray.SCREEN_OFF_ARGS)
+        self.assertIn("-w", adbtray.SCREEN_OFF_ARGS)
+        self.assertIn("--power-off-on-close", adbtray.SCREEN_OFF_ARGS)
+
+    def test_launch_merges_user_args_and_dedupes(self):
+        with mock.patch.object(adbtray, "scrcpy_running",
+                               return_value=False), \
+             mock.patch("subprocess.Popen") as pop, \
+             mock.patch.object(adbtray, "S") as s:
+            s.get.return_value = "--max-fps 60 -S"
+            self.assertTrue(adbtray.launch_scrcpy_screen_off(self.T))
+            cmd = pop.call_args[0][0]
+            self.assertEqual(cmd[:3], ["scrcpy", "-s", self.T])
+            self.assertEqual(cmd.count("-S"), 1)
+            for a in adbtray.SCREEN_OFF_ARGS:
+                self.assertIn(a, cmd)
+
+    def test_launch_skips_restart_when_already_off(self):
+        with mock.patch.object(adbtray, "scrcpy_running",
+                               return_value=True), \
+             mock.patch.object(
+                 adbtray, "_scrcpy_cmdline",
+                 return_value=f"1234 scrcpy -s {self.T} -S -w"), \
+             mock.patch.object(adbtray, "stop_scrcpy") as stop, \
+             mock.patch("subprocess.Popen") as pop, \
+             mock.patch.object(adbtray, "notify"):
+            self.assertTrue(adbtray.launch_scrcpy_screen_off(self.T))
+            stop.assert_not_called()
+            pop.assert_not_called()
+
+    def test_launch_restarts_when_running_without_flag(self):
+        with mock.patch.object(adbtray, "scrcpy_running",
+                               side_effect=[True, False, False]), \
+             mock.patch.object(
+                 adbtray, "_scrcpy_cmdline",
+                 return_value=f"1234 scrcpy -s {self.T}"), \
+             mock.patch.object(adbtray, "stop_scrcpy",
+                               return_value=True) as stop, \
+             mock.patch("subprocess.Popen") as pop, \
+             mock.patch.object(adbtray, "S") as s:
+            s.get.return_value = ""
+            self.assertTrue(adbtray.launch_scrcpy_screen_off(self.T))
+            stop.assert_called_once_with(self.T)
+            pop.assert_called_once()
+
+    def test_stop_kills_only_matching_target(self):
+        out = ("111 scrcpy -s 10.0.0.1:5555\n"
+               f"222 scrcpy -s {self.T}\n")
+        with mock.patch.object(adbtray, "sh", return_value=out), \
+             mock.patch("os.kill") as kill:
+            self.assertTrue(adbtray.stop_scrcpy(self.T))
+            kill.assert_called_once_with(222, 15)
+
+    def test_device_screen_on_reports_adb_result(self):
+        ok = mock.Mock(returncode=0)
+        with mock.patch("subprocess.run", return_value=ok) as run:
+            self.assertTrue(adbtray.device_screen_on(self.T))
+            first = run.call_args_list[0][0][0]
+            self.assertIn("KEYCODE_WAKEUP", first)
+        bad = mock.Mock(returncode=1)
+        with mock.patch("subprocess.run", return_value=bad):
+            self.assertFalse(adbtray.device_screen_on(self.T))
+
+    def test_screen_off_active_matches_flag_token_only(self):
+        with mock.patch.object(
+                adbtray, "_scrcpy_cmdline",
+                return_value=f"1234 scrcpy -s {self.T}"):
+            self.assertFalse(adbtray.scrcpy_screen_off_active(self.T))
+        with mock.patch.object(
+                adbtray, "_scrcpy_cmdline",
+                return_value=f"1234 scrcpy -s {self.T} -S -w"):
+            self.assertTrue(adbtray.scrcpy_screen_off_active(self.T))
+        with mock.patch.object(
+                adbtray, "_scrcpy_cmdline",
+                return_value=f"1234 scrcpy -s {self.T} --turn-screen-off"):
+            self.assertTrue(adbtray.scrcpy_screen_off_active(self.T))
+        with mock.patch.object(adbtray, "_scrcpy_cmdline", return_value=""):
+            self.assertFalse(adbtray.scrcpy_screen_off_active(self.T))
+
+    def test_cli_parity_for_screen_commands(self):
+        """screen-off/screen-on must exist in help, parsing and dispatch."""
+        root = os.path.join(os.path.dirname(__file__), "..")
+        with open(os.path.join(root, "scripts", "adbconnect.sh"),
+                  encoding="utf-8") as f:
+            sh_src = f.read()
+        for cmd in ("screen-off", "screen-on"):
+            self.assertIn(cmd, sh_src)
+        self.assertIn("action_screen", sh_src)
+        with open(os.path.join(root, "scripts", "adbconnect.ps1"),
+                  encoding="utf-8") as f:
+            ps_src = f.read()
+        for cmd in ("screen-off", "screen-on"):
+            self.assertIn(cmd, ps_src)
+        self.assertIn("Invoke-ScreenOff", ps_src)
+        self.assertIn("Invoke-ScreenOn", ps_src)
+
+    def test_windows_flag_check_is_case_sensitive(self):
+        """PowerShell -match is case-insensitive: the -S check must use
+        -cmatch, otherwise lowercase -s always looks like screen-off."""
+        with open(os.path.join(os.path.dirname(__file__), "..", "scripts",
+                               "adbconnect.ps1"), encoding="utf-8") as f:
+            ps_src = f.read()
+        self.assertIn("-cmatch '(^|\\s)-S(\\s|$)", ps_src)
+
+    def test_menu_wiring_present_in_source(self):
+        with open(os.path.join(os.path.dirname(__file__), "..", "tray",
+                               "adbtray.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("run_scrcpy_screen_off", src)
+        self.assertIn("turn_screen_on", src)
+        self.assertIn("Screen off (laptop only)", src)
+        self.assertIn("Screen on", src)
+
+    def test_no_target_interpolation_in_shell_commands(self):
+        """A hostile serial must not reach a shell: matching stays in Python."""
+        with open(os.path.join(os.path.dirname(__file__), "..", "tray",
+                               "adbtray.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertNotIn("*-s {target}*", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

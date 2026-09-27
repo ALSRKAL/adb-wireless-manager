@@ -1,6 +1,7 @@
 # ==============================================================================
-#  ADB Wireless Manager - Windows CLI  v14.0.1
-#  connect / reconnect / list / disconnect / pair / watch / doctor
+#  ADB Wireless Manager - Windows CLI  v14.1.0
+#  connect / reconnect / list / disconnect / pair / watch / doctor /
+#  screen-off / screen-on
 #  Prefers Android 11+ wireless debugging over mDNS; the classic 'adb tcpip'
 #  path is a fallback only, because it restarts adbd and switches the phone's
 #  Wireless-debugging toggle off.
@@ -11,7 +12,7 @@
 param(
     [Parameter(Position = 0)]
     [ValidateSet('connect', 'reconnect', 'r', 'list', 'l', 'disconnect',
-                 'pair', 'watch', 'doctor', 'help')]
+                 'pair', 'watch', 'doctor', 'help', 'screen-off', 'screen-on')]
     [string]$Command = 'connect',
 
     [Parameter(Position = 1, ValueFromRemainingArguments = $true)]
@@ -243,6 +244,57 @@ function Invoke-Scrcpy([string]$Target, [string]$Label) {
     Write-Log 'INFO' "Launching scrcpy..."
     Start-Process -FilePath 'scrcpy' -ArgumentList "-s", $Target |
         Out-Null
+}
+
+function Invoke-ScreenOff([string]$Target) {
+    if (-not (Get-Command scrcpy -ErrorAction SilentlyContinue)) {
+        Write-Log 'ERR' 'scrcpy not found.'; return
+    }
+    $needle = [regex]::Escape("-s $Target")
+    $rows = Get-CimInstance Win32_Process -Filter "Name='scrcpy.exe'" |
+        ForEach-Object { "$($_.ProcessId) $($_.CommandLine)" }
+    $match = @($rows | Where-Object { $_ -cmatch $needle })
+    if ($match.Count -gt 0 -and
+        ($match | Where-Object { $_ -cmatch '(^|\s)-S(\s|$)|--turn-screen-off' })) {
+        Write-Log 'INFO' "Screen already off: $Target"; return
+    }
+    foreach ($m in $match) {
+        $pidText = ($m -split '\s+', 2)[0]
+        if ($pidText -match '^\d+$') {
+            Stop-Process -Id ([int]$pidText) -Force
+        }
+    }
+    if ($match.Count -gt 0) { Start-Sleep 1 }
+    Write-Log 'INFO' "Turning screen off for $Target (laptop only)..."
+    Start-Process -FilePath 'scrcpy' -ArgumentList "-s", $Target,
+        "-S", "-w", "--power-off-on-close", "--disable-screensaver" |
+        Out-Null
+}
+
+function Invoke-ScreenOn([string]$Target) {
+    & adb -s $Target shell input keyevent KEYCODE_WAKEUP | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Log 'ERR' "Could not turn screen on for $Target - check the connection."
+        return
+    }
+    Start-Sleep 1
+    & adb -s $Target shell input keyevent 82 | Out-Null
+    Write-Log 'OK' "Screen on: $Target"
+}
+
+function Invoke-Screen([string]$Mode, [string]$What) {
+    if (-not $What -or $What -eq 'all') {
+        $targets = @(Get-DeviceList | Where-Object { $_.State -eq 'device' } |
+            ForEach-Object { $_.Serial })
+        if ($targets.Count -eq 0) {
+            Write-Log 'WARN' 'No wireless connections right now.'; return
+        }
+    } else {
+        $targets = @($What)
+    }
+    foreach ($t in $targets) {
+        if ($Mode -eq 'off') { Invoke-ScreenOff $t } else { Invoke-ScreenOn $t }
+    }
 }
 
 function Invoke-ConnectUsb {
@@ -479,7 +531,7 @@ function Invoke-Doctor {
 
 function Show-Help {
     Write-Host @"
-ADB Wireless Manager v14.0.1 (Windows)
+ADB Wireless Manager v14.1.0 (Windows)
 
 Usage: .\scripts\adbconnect.ps1 [command] [-Port N] [-Retries N] [-NoScrcpy]
 
@@ -490,6 +542,8 @@ Commands:
   disconnect   drop wireless links on this machine
   pair         Android 11+ wireless pairing (mDNS discovery)
   watch        keep known devices connected (healing loop)
+  screen-off [t|all] mirror with the physical screen off (laptop only)
+  screen-on [t|all]  wake the physical screen, mirroring continues
   doctor       environment diagnostics
   help         this screen
 
@@ -513,6 +567,8 @@ switch ($Command) {
     'list'       { Show-List }
     'l'          { Show-List }
     'disconnect' { Invoke-Disconnect ($Args | Select-Object -First 1) }
+    'screen-off' { Invoke-Screen 'off' ($Args | Select-Object -First 1) }
+    'screen-on'  { Invoke-Screen 'on' ($Args | Select-Object -First 1) }
     'pair'       { Invoke-Pair ($Args | Select-Object -First 1)
                    ($Args | Select-Object -Skip 1 -First 1) }
     'watch'      { Invoke-WatchLoop }

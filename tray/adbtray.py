@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QMenu, QMessageBox, QProgressBar, QPushButton,
                              QSpinBox, QSystemTrayIcon, QVBoxLayout, QWidget)
 
-__version__ = "14.0.1"
+__version__ = "14.1.0"
 REPO = "ALSRKAL/adb-wireless-manager"
 REPO_URL = f"https://github.com/{REPO}"
 
@@ -859,20 +859,56 @@ def launch_scrcpy(target, extra_args=""):
 SCREEN_OFF_ARGS = ["-S", "-w", "--power-off-on-close", "--disable-screensaver"]
 
 
+def _scrcpy_cmdline(target):
+    """Full command line of the scrcpy process mirroring target, else "".
+
+    The target is matched in Python, never interpolated into a shell
+    command, so a hostile device serial cannot inject commands.
+    """
+    try:
+        if IS_WINDOWS:
+            out = sh(["powershell", "-NoProfile", "-Command",
+                      "Get-CimInstance Win32_Process "
+                      "-Filter \"Name='scrcpy.exe'\" | ForEach-Object { "
+                      "\"$($_.ProcessId) $($_.CommandLine)\" }"], 8)
+        else:
+            out = sh(["pgrep", "-af", "scrcpy"], 5)
+        for line in (out or "").splitlines():
+            if f"-s {target}" in line:
+                return line
+        return ""
+    except Exception:
+        return ""
+
+
+def scrcpy_screen_off_active(target):
+    """True when the running scrcpy for target already turns the screen off."""
+    parts = _scrcpy_cmdline(target).split()
+    return "-S" in parts or "--turn-screen-off" in parts
+
+
 def stop_scrcpy(target):
     """Kill scrcpy process(es) for one target only. Best effort, never raises."""
     try:
         if IS_WINDOWS:
-            # Kill only the scrcpy.exe whose command line contains this target.
-            # PowerShell one-liner: find + Stop-Process, ignore errors.
-            subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 f"Get-CimInstance Win32_Process -Filter \"Name='scrcpy.exe'\" "
-                 f"| Where-Object {{ $_.CommandLine -like '*-s {target}*' }} "
-                 f"| ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"],
-                capture_output=True, timeout=8,
-            )
-            return True
+            out = sh(["powershell", "-NoProfile", "-Command",
+                      "Get-CimInstance Win32_Process "
+                      "-Filter \"Name='scrcpy.exe'\" | ForEach-Object { "
+                      "\"$($_.ProcessId) $($_.CommandLine)\" }"], 8)
+            killed = False
+            for line in (out or "").splitlines():
+                if f"-s {target}" not in line:
+                    continue
+                pid = line.strip().split(None, 1)[0]
+                if not pid.isdigit():
+                    continue
+                try:
+                    subprocess.run(["taskkill", "/PID", pid, "/F"],
+                                   capture_output=True, timeout=8)
+                    killed = True
+                except Exception:
+                    continue
+            return killed
         out = sh(["pgrep", "-af", "scrcpy"], 5)
         killed = False
         for line in (out or "").splitlines():
@@ -896,6 +932,7 @@ def launch_scrcpy_screen_off(target, extra_args=""):
 
     Same method as: scrcpy -S -w --power-off-on-close --disable-screensaver
     Physical touch dies automatically while screen is off, laptop keeps control.
+    A scrcpy that already runs with the screen off is left alone.
     """
     base = str(extra_args if extra_args else (S.get("scrcpy_args") or ""))
     parts = base.split() if base else []
@@ -903,6 +940,10 @@ def launch_scrcpy_screen_off(target, extra_args=""):
         if a not in parts:
             parts.append(a)
     if scrcpy_running(target):
+        if scrcpy_screen_off_active(target):
+            notify(tr("الشاشة طافية بالفعل", "Screen already off"),
+                   target)
+            return True
         stop_scrcpy(target)
         for _ in range(20):
             if not scrcpy_running(target):
@@ -926,11 +967,25 @@ def launch_scrcpy_screen_off(target, extra_args=""):
 
 
 def device_screen_on(target):
-    """Turn physical screen back ON, mirroring keeps working."""
-    sh(["adb", "-s", target, "shell", "input", "keyevent",
-        "KEYCODE_WAKEUP"], 6)
+    """Turn physical screen back ON, mirroring keeps working.
+
+    Returns True only when the device answers the wake command.
+    """
+    try:
+        r = subprocess.run(["adb", "-s", target, "shell", "input",
+                            "keyevent", "KEYCODE_WAKEUP"],
+                           capture_output=True, timeout=6)
+        if r.returncode != 0:
+            return False
+    except Exception:
+        return False
     time.sleep(0.3)
-    sh(["adb", "-s", target, "shell", "input", "keyevent", "82"], 6)
+    try:
+        subprocess.run(["adb", "-s", target, "shell", "input",
+                        "keyevent", "82"],
+                       capture_output=True, timeout=6)
+    except Exception:
+        pass
     return True
 
 
@@ -2601,9 +2656,14 @@ class Tray(QSystemTrayIcon):
 
     def turn_screen_on(self, target):
         def job():
-            device_screen_on(target)
-            self.op_done.emit("scrcpy",
-                              tr("تم تشغيل الشاشة", "Screen on"))
+            if device_screen_on(target):
+                self.op_done.emit("scrcpy",
+                                  tr("تم تشغيل الشاشة", "Screen on"))
+            else:
+                self.op_done.emit(
+                    "scrcpy",
+                    tr("تعذر تشغيل الشاشة - تحقق من الاتصال",
+                       "Could not turn screen on - check the connection"))
         self.run_job(job)
 
     def doctor(self):

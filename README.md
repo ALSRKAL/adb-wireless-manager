@@ -67,6 +67,7 @@ consuming the whole retry budget.
 | Manual pause: a device you disconnect stays offline until you reconnect it | yes | yes |
 | Wireless pairing wizard for Android 11+ with a readiness checklist | yes | yes |
 | Screen mirroring per device through scrcpy | yes | - |
+| Screen off per device (laptop-only control), screen on | yes | yes |
 | Screenshot and 30-second screen recording, saved to the desktop | yes | - |
 | APK installer with a drop zone, per-file progress and a working cancel | yes | - |
 | Device info: battery, storage, Android version, addresses | yes | - |
@@ -144,7 +145,13 @@ From the command line:
 ./scripts/adbconnect.sh disconnect   # drop wireless links on this machine
 ./scripts/adbconnect.sh doctor       # environment diagnostics
 ./scripts/adbconnect.sh pair         # Android 11+ wireless pairing
+./scripts/adbconnect.sh screen-off   # mirror with the physical screen off
+./scripts/adbconnect.sh screen-on    # wake the physical screen
 ```
+
+To turn a device screen off from the tray, open its menu and choose
+`Screen off (laptop only)` - mirroring continues on the laptop while the
+physical touch dies on its own. `Screen on` wakes it back up.
 
 ### What survives what
 
@@ -222,6 +229,7 @@ path may call `adb usb`, and no shipped file may contain decorative glyphs.
 | Tray icon missing on GNOME | Enable AppIndicators, then log out and back in |
 | Port already in use | Ports are probed upward from 5555 to 5699 |
 | scrcpy window never opens | Install scrcpy, or set `AUTO_SCRCPY=false` |
+| Screenshot comes out black | The physical screen is off - use Screen on first |
 
 ## Contributing
 
