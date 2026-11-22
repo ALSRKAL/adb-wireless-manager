@@ -11,6 +11,17 @@ Connect to Android devices over Wi-Fi from a system-tray menu or the command
 line. Handles several devices at once, keeps links alive across network drops
 and reboots, and mirrors screens through scrcpy.
 
+## Demo
+
+> **Placeholder, marked for later** - screenshots and a short demo clip land
+> here. They drop in without touching the rest of the page:
+>
+> <!--
+> ![Tray menu: every device in one row, whatever its transport](docs/demo/tray.png)
+> ![Wireless pairing wizard for Android 11+](docs/demo/pairing.png)
+> ![scrcpy mirroring launched from the tray](docs/demo/scrcpy.gif)
+> -->
+
 ## How it connects
 
 Android 11 introduced Wireless debugging, a TLS service the phone advertises
