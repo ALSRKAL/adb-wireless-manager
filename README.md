@@ -13,14 +13,14 @@ and reboots, and mirrors screens through scrcpy.
 
 ## Demo
 
-> **Placeholder, marked for later** - screenshots and a short demo clip land
-> here. They drop in without touching the rest of the page:
->
-> <!--
-> ![Tray menu: every device in one row, whatever its transport](docs/demo/tray.png)
-> ![Wireless pairing wizard for Android 11+](docs/demo/pairing.png)
-> ![scrcpy mirroring launched from the tray](docs/demo/scrcpy.gif)
-> -->
+![Tray menu: every device in one row, whatever its transport](docs/demo/tray.png)
+
+Two phones connected at once - one over USB, one wireless - each with its
+own submenu.
+
+![Wireless pairing wizard for Android 11+](docs/demo/pairing.png)
+
+The pairing wizard checks that the phone is ready before you pair.
 
 ## How it connects
 
