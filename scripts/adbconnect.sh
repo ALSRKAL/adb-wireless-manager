@@ -117,6 +117,7 @@ declare -A T_AR=(
   [dev_offline]="الاتصال معلّق في حالة offline - إصلاح..."
   [reset]="تنظيف الاتصال من جهة الحاسب..."
   [wrong_dev]="العنوان %s يخص جهازًا آخر (%s) - تم إلغاء الاتصال."
+  [no_serial]="تعذّر التحقق من هوية %s (قراءة السيريال فشلت) - تم إلغاء الاتصال."
   [refused]="لا شيء يستمع على %s - التصحيح اللاسلكي مغلق أو المنفذ تغيّر."
   [no_answer]="لا استجابة من %s خلال المهلة - العنوان غير قابل للوصول."
   [wireless_on]="تفعيل التصحيح اللاسلكي على الجهاز..."
@@ -171,6 +172,7 @@ declare -A T_EN=(
   [dev_offline]="Transport stuck offline - healing..."
   [reset]="Clearing the transport on the host side..."
   [wrong_dev]="%s belongs to a different device (%s) - connection dropped."
+  [no_serial]="Could not verify the identity of %s (serial unreadable) - connection dropped."
   [refused]="Nothing is listening on %s - wireless debugging is off or the port changed."
   [no_answer]="No answer from %s within the timeout - the address is unreachable."
   [wireless_on]="Turning wireless debugging on over the cable..."
@@ -500,10 +502,19 @@ connect_target() { # expected_serial ip port -> 0 on verified success
                     got=$(serial_of_target "$target")
                     # identity check: refuse a phone that merely inherited
                     # this address from the one we were looking for
-                    if [[ -n "$want" && -n "$got" && "$want" != "$got" ]]; then
-                        adbc disconnect "$target" >/dev/null 2>&1
-                        log ERR "$(t wrong_dev "$target" "$got")"
-                        return 1
+                    if [[ -n "$want" ]]; then
+                        # fail closed: an unreadable serial must not pass as
+                        # a match, or a healed link could adopt a stranger
+                        if [[ -z "$got" ]]; then
+                            adbc disconnect "$target" >/dev/null 2>&1
+                            log ERR "$(t no_serial "$target")"
+                            return 1
+                        fi
+                        if [[ "$want" != "$got" ]]; then
+                            adbc disconnect "$target" >/dev/null 2>&1
+                            log ERR "$(t wrong_dev "$target" "$got")"
+                            return 1
+                        fi
                     fi
                     log OK "$(t ok "$target")"
                     return 0
