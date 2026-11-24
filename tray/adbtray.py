@@ -807,7 +807,15 @@ def connect_and_verify(target, expect_serial="", attempts=None):
                 reason = tr("الاتصال قائم لكن الجهاز لا يستجيب للأوامر",
                             "linked but the device answers no commands")
                 heal_offline_transport(target)
-            elif want and probe["serial"] and probe["serial"] != want:
+            elif want and not probe["serial"]:
+                # fail closed: an unreadable serial must not pass as a
+                # match, or a healed link could adopt a stranger
+                sh(["adb", "disconnect", target], 6)
+                return False, "", tr(
+                    f"تعذّر التحقق من هوية {target} - تم إلغاء الاتصال",
+                    f"could not verify the identity of {target} - "
+                    f"connection dropped")
+            elif want and probe["serial"] != want:
                 sh(["adb", "disconnect", target], 6)
                 return False, probe["serial"], tr(
                     f"العنوان {target} يخص جهازًا آخر ({probe['serial']})",
