@@ -1307,5 +1307,56 @@ class ScreenOffOnTests(unittest.TestCase):
         self.assertNotIn("*-s {target}*", src)
 
 
+class ConnectVerifyTests(unittest.TestCase):
+    """Identity verification must fail closed on the wireless path."""
+
+    TARGET = "1.2.3.4:5555"
+
+    def _run(self, probe, expect="SER1"):
+        with mock.patch.object(adbtray, "sh",
+                               return_value="connected") as msh, \
+             mock.patch.object(adbtray, "target_state",
+                               return_value="device"), \
+             mock.patch.object(adbtray, "probe_device",
+                               return_value=probe), \
+             mock.patch.object(adbtray.time, "sleep", return_value=None):
+            result = adbtray.connect_and_verify(self.TARGET, expect,
+                                                attempts=1)
+        return result, msh
+
+    def _disconnected(self, msh):
+        return ["adb", "disconnect", self.TARGET] in \
+            [c.args[0] for c in msh.call_args_list]
+
+    def test_unreadable_serial_disconnects_and_fails(self):
+        probe = dict(adbtray.EMPTY_PROBE, alive=True, serial="")
+        (ok, got, reason), msh = self._run(probe)
+        self.assertFalse(ok)
+        self.assertEqual(got, "")
+        self.assertTrue(reason)
+        self.assertTrue(self._disconnected(msh))
+
+    def test_wrong_serial_disconnects_and_fails(self):
+        probe = dict(adbtray.EMPTY_PROBE, alive=True, serial="OTHER9")
+        (ok, got, reason), msh = self._run(probe)
+        self.assertFalse(ok)
+        self.assertEqual(got, "OTHER9")
+        self.assertTrue(reason)
+        self.assertTrue(self._disconnected(msh))
+
+    def test_matching_serial_passes(self):
+        probe = dict(adbtray.EMPTY_PROBE, alive=True, serial="SER1")
+        (ok, got, reason), msh = self._run(probe)
+        self.assertTrue(ok)
+        self.assertEqual(got, "SER1")
+        self.assertFalse(self._disconnected(msh))
+
+    def test_fresh_pair_without_expected_serial_still_passes(self):
+        probe = dict(adbtray.EMPTY_PROBE, alive=True, serial="NEW9")
+        (ok, got, reason), _ = self._run(probe, expect="")
+        self.assertTrue(ok)
+        self.assertEqual(got, "NEW9")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
